@@ -11,14 +11,14 @@ from flask import Flask
 # 🔑 CREDENCIALES (Configuradas en Render)
 # =========================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-# En Render pon: 338647966, -5136216182
+# En Render debe ser: 338647966, -5136216182
 CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # =========================================================
 # ⚙️ CONFIGURACIÓN "MODO TITÁN"
 # =========================================================
-UMBRAL_ALERTA = 1000       # Sensibilidad +/- $500 USD
-MIN_LIQUIDITY = 500       # Mínimo $100 USD de liquidez real
+UMBRAL_ALERTA = 500       # Sensibilidad +/- $500 USD
+MIN_LIQUIDITY = 100       # Mínimo $100 USD de liquidez real
 INTERVALO_ESC_SEG = 300   # Escaneo cada 5 minutos
 DEPTH_PERCENT = 10.0      # Rango de profundidad (10%)
 
@@ -35,25 +35,26 @@ memoria_deltas = {}
 
 @app.route('/')
 def home():
-    return f"🛰️ Radar 10k Online. Usuarios: {len(CHAT_IDS_RAW.split(','))}. Mercados: {len(memoria_deltas)}", 200
+    return f"🛰️ Radar Multi-ID Activo. Mercados: {len(memoria_deltas)}", 200
 
 def enviar_telegram(mensaje):
-    """ Envía el mensaje a cada ID en la lista de Render """
+    """ Envía el mensaje a cada ID de la lista por separado """
     ids = [idx.strip() for idx in CHAT_IDS_RAW.split(',') if idx.strip()]
+    
     for cid in ids:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": cid, "text": mensaje, "parse_mode": "Markdown"}
         try:
             r = requests.post(url, data=payload, timeout=10)
             if r.status_code == 200:
-                print(f"✅ Enviado a: {cid}")
+                print(f"✅ EXITO: Mensaje enviado a {cid}")
             else:
-                print(f"❌ Error en {cid}: {r.text}")
-        except:
-            print(f"❌ Fallo de conexión con {cid}")
+                # Esto nos dirá exactamente por qué falla en el grupo
+                print(f"❌ ERROR en ID {cid}: {r.text}")
+        except Exception as e:
+            print(f"❌ FALLO DE CONEXIÓN con {cid}: {e}")
 
 def calcular_delta_mercado(m):
-    """ Análisis profundo de libros de órdenes YES/NO """
     try:
         tokens = json.loads(m.get('clobTokenIds', '[]'))
         prices = json.loads(m.get('outcomePrices', '["0.5"]'))
@@ -62,18 +63,15 @@ def calcular_delta_mercado(m):
         token_yes, token_no = tokens[0], tokens[1]
         precio_mkt = float(prices[0])
         
-        # Consultas paralelas al CLOB
         res_yes = requests.get(f"https://clob.polymarket.com/book?token_id={token_yes}", timeout=5).json()
         res_no = requests.get(f"https://clob.polymarket.com/book?token_id={token_no}", timeout=5).json()
         
         dist = precio_mkt * (DEPTH_PERCENT / 100.0)
         piso, techo = precio_mkt - dist, precio_mkt + dist
         
-        # Bids (Compras)
         b_usd = sum(float(b['price']) * float(b['size']) for b in res_yes.get('bids', []) if float(b['price']) >= piso)
         b_usd += sum((1.0 - float(a['price'])) * float(a['size']) for a in res_no.get('asks', []) if (1.0 - float(a['price'])) >= piso)
         
-        # Asks (Ventas)
         a_usd = sum(float(a['price']) * float(a['size']) for a in res_yes.get('asks', []) if float(a['price']) <= techo)
         a_usd += sum((1.0 - float(b['price'])) * float(b['size']) for b in res_no.get('bids', []) if (1.0 - float(a['price'])) <= techo)
         
@@ -88,7 +86,6 @@ def bucle_principal():
 
     while True:
         try:
-            # 1. BARRIDO MASIVO (Hasta 10,000)
             all_m, offset = [], 0
             while offset < 10000:
                 url = f"https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={offset}&order=liquidity&ascending=false"
@@ -98,14 +95,11 @@ def bucle_principal():
                 offset += 100
                 if float(data[-1].get('liquidity', 0)) < 20: break
 
-            # 2. FILTRADO
             filtrados = [m for m in all_m if not any(w in m.get('question','').lower() for w in blacklist) and float(m.get('liquidity', 0)) >= MIN_LIQUIDITY]
 
-            # 3. ESCANEO MULTIHILO (Potencia dinámica)
             with ThreadPoolExecutor() as executor:
                 resultados = list(executor.map(calcular_delta_mercado, filtrados))
 
-            # 4. DETECCIÓN Y TIEMPO
             ahora = time.time()
             for i, m in enumerate(filtrados):
                 id_m = m['question']
@@ -135,14 +129,13 @@ def bucle_principal():
                 else:
                     memoria_deltas[id_m] = {'delta': d_actual, 'first_seen': ahora}
 
-            print(f"✅ Ciclo completado: {datetime.now().strftime('%H:%M:%S')} - Memoria: {len(memoria_deltas)}")
+            print(f"✅ Ciclo completado: {datetime.now().strftime('%H:%M:%S')}")
             time.sleep(INTERVALO_ESC_SEG)
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Error en bucle: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
     threading.Thread(target=bucle_principal, daemon=True).start()
-    # El puerto 10000 es el estándar de Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
