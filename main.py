@@ -17,8 +17,8 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # ⚙️ CONFIGURACIÓN "MODO TITÁN"
 # =========================================================
-UMBRAL_ALERTA = 500       # Sensibilidad +/- $500 USD
-MIN_LIQUIDITY = 100       # Mínimo $100 USD de liquidez real
+UMBRAL_ALERTA = 1000       # Sensibilidad +/- $500 USD
+MIN_LIQUIDITY = 500       # Mínimo $100 USD de liquidez real
 INTERVALO_ESC_SEG = 300   # Escaneo cada 5 minutos
 DEPTH_PERCENT = 10.0      # Rango de profundidad (10%)
 
@@ -139,3 +139,4 @@ if __name__ == "__main__":
     threading.Thread(target=bucle_principal, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
