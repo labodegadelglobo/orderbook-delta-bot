@@ -16,8 +16,8 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # ⚙️ CONFIGURACIÓN "BARREDOR TOTAL"
 # =========================================================
-UMBRAL_ALERTA = 500       
-MIN_LIQUIDITY = 150       # Filtro de entrada (Liquidez real en API)
+UMBRAL_ALERTA = 900       
+MIN_LIQUIDITY = 400       # Filtro de entrada (Liquidez real en API)
 INTERVALO_ESC_SEG = 300   # Escaneo cada 5 minutos
 DEPTH_PERCENT = 10.0      
 
@@ -126,3 +126,4 @@ def bucle_principal():
 if __name__ == "__main__":
     threading.Thread(target=bucle_principal, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
