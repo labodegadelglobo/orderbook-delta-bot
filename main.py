@@ -16,8 +16,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # =========================================================
 # ⚙️ CONFIGURACIÓN DEL RADAR (Ajusta tus niveles aquí)
 # =========================================================
-UMBRAL_ALERTA = 5000      # Te avisa si el Delta cambia más de $5,000 USD
-MIN_LIQUIDITY = 1200      # Liquidez mínima para vigilar el mercado
+UMBRAL_ALERTA = 500      # Te avisa si el Delta cambia más de $5,000 USD
+MIN_LIQUIDITY = 100      # Liquidez mínima para vigilar el mercado
 INTERVALO_ESC_SEG = 300   # Escaneo cada 5 minutos
 DEPTH_PERCENT = 10.0      # Rango de profundidad (0-10%)
 
@@ -145,3 +145,4 @@ if __name__ == "__main__":
     # Iniciar servidor web para Render/UptimeRobot
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
