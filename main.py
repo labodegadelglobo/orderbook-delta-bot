@@ -16,8 +16,8 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # ⚙️ CONFIGURACIÓN "TURBO BARREDOR 2.0"
 # =========================================================
-UMBRAL_ALERTA = 900       
-MIN_LIQUIDITY = 450       # Subimos a 150 para filtrar mercados con más "carne"
+UMBRAL_ALERTA = 4000       
+MIN_LIQUIDITY = 900       # Subimos a 150 para filtrar mercados con más "carne"
 INTERVALO_ESC_SEG = 300   
 DEPTH_PERCENT = 10.0      
 
@@ -117,3 +117,4 @@ def bucle_principal():
 if __name__ == "__main__":
     threading.Thread(target=bucle_principal, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
