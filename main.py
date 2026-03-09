@@ -16,13 +16,13 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # ⚙️ CONFIGURACIÓN "TURBO BARREDOR 2.0"
 # =========================================================
-UMBRAL_ALERTA = 4000       
-MIN_LIQUIDITY = 900       # Subimos a 150 para filtrar mercados con más "carne"
+UMBRAL_ALERTA = 5000       
+MIN_LIQUIDITY = 1000       # Subimos a 150 para filtrar mercados con más "carne"
 INTERVALO_ESC_SEG = 300   
 DEPTH_PERCENT = 10.0      
 
 blacklist = [
-    'rounds', 'fight', 'ko', 'tko', 'stoppage', 'points', 'rebounds', 
+    'rounds', 'fight', 'ko', 'tko', 'vs', 'stoppage', 'points', 'rebounds', 
     'assists', 'pts', 'reb', 'ast', 'spread', 'game', 'xrp', 'btc', 
     'eth', 'sol', 'crypto', 'bitcoin', 'ethereum', 'solana', 'doge', 'pepe',
     'nba', 'nfl', 'soccer', 'football', 'ufc', 'boxing', 'tennis', 'mlb', 'nhl'
@@ -117,4 +117,5 @@ def bucle_principal():
 if __name__ == "__main__":
     threading.Thread(target=bucle_principal, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
 
