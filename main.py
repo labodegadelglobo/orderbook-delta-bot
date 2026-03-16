@@ -14,12 +14,16 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # =========================================================
-# ⚙️ CONFIGURACIÓN "TURBO BARREDOR 4.0" (Estable + Historial)
+# ⚙️ CONFIGURACIÓN "FRANCOTIRADOR 5.0" (Ajustables)
 # =========================================================
-UMBRAL_ALERTA = 5000       
-MIN_LIQUIDITY = 1000       
+UMBRAL_ALERTA = 3000       # Sugerencia: Bajar a 3000 para cazar Inside Info temprano
+MIN_LIQUIDITY = 500        # Sugerencia: Bajar a 500 para ver mercados emergentes
 INTERVALO_ESC_SEG = 300   
 DEPTH_PERCENT = 10.0      
+
+# 🧠 NUEVOS FILTROS DE MICROESTRUCTURA (Puedes jugar con ellos)
+MIN_SPREAD_PCT = 3.0       # % Mínimo de hueco (Urgencia) entre comprador y vendedor
+MIN_TOXICITY_PCT = 5.0     # % Mínimo del mercado que barrió la ballena (Toxicidad)
 
 blacklist = [
     'rounds', 'fight', 'ko', 'tko', 'vs', 'stoppage', 'points', 'rebounds', 
@@ -31,12 +35,12 @@ blacklist = [
 app = Flask(__name__)
 memoria_deltas = {}
 
-# 🚀 OPTIMIZACIÓN: Reutilizar conexiones para mayor velocidad y menor consumo RAM
+# 🚀 OPTIMIZACIÓN: Reutilizar conexiones para mayor velocidad
 session = requests.Session()
 
 @app.route('/')
 def home():
-    return f"🛰️ Radar 10k Online | Mercados en vigilancia: {len(memoria_deltas)}", 200
+    return f"🛰️ Radar Institucional 5.0 | Mercados en vigilancia: {len(memoria_deltas)}", 200
 
 def enviar_telegram(mensaje):
     ids = [idx.strip() for idx in CHAT_IDS_RAW.split(',') if idx.strip()]
@@ -46,7 +50,8 @@ def enviar_telegram(mensaje):
         try: session.post(url, data=payload, timeout=10)
         except: pass
 
-def calcular_delta_mercado(m):
+def calcular_datos_mercado(m):
+    """ Modificado para extraer Delta, Best Bid y Best Ask simultáneamente """
     try:
         tokens = json.loads(m.get('clobTokenIds', '[]'))
         prices = json.loads(m.get('outcomePrices', '["0.5"]'))
@@ -57,19 +62,29 @@ def calcular_delta_mercado(m):
         
         res_yes = session.get(f"https://clob.polymarket.com/book?token_id={token_yes}", timeout=5).json()
         
+        # 1. Extraer puntas de mercado (Best Bid y Best Ask)
+        bids = res_yes.get('bids', [])
+        asks = res_yes.get('asks', [])
+        best_bid = float(bids[0]['price']) if bids else 0.0
+        best_ask = float(asks[0]['price']) if asks else 1.0
+        
+        # 2. Calcular Delta
         dist = precio_mkt * (DEPTH_PERCENT / 100.0)
         piso, techo = precio_mkt - dist, precio_mkt + dist
+        b_usd = sum(float(b['price']) * float(b['size']) for b in bids if float(b['price']) >= piso)
+        a_usd = sum(float(a['price']) * float(a['size']) for a in asks if float(a['price']) <= techo)
         
-        b_usd = sum(float(b['price']) * float(b['size']) for b in res_yes.get('bids', []) if float(b['price']) >= piso)
-        a_usd = sum(float(a['price']) * float(a['size']) for a in res_yes.get('asks', []) if float(a['price']) <= techo)
-        
-        return int(b_usd - a_usd)
+        return {
+            'delta': int(b_usd - a_usd),
+            'best_bid': best_bid,
+            'best_ask': best_ask
+        }
     except: return None
 
 def bucle_principal():
     global memoria_deltas
-    print("🤖 Modo Perfeccionado 4.0 Online.")
-    enviar_telegram("🚀 *Radar Estable:* Formato con historial activado. Protecciones anti-caídas en línea.")
+    print("🤖 Modo Institucional 5.0 Online.")
+    enviar_telegram("🚀 *Radar Quant Activado:* Filtros de Spread y Toxicidad en línea. Cazando ballenas informadas...")
 
     while True:
         try:
@@ -92,34 +107,50 @@ def bucle_principal():
             
             # 🛠️ LA VACUNA 2: 5 trabajadores en vez de 12
             with ThreadPoolExecutor(max_workers=5) as executor:
-                resultados = list(executor.map(calcular_delta_mercado, filtrados))
+                resultados = list(executor.map(calcular_datos_mercado, filtrados))
 
             for i, m in enumerate(filtrados):
                 id_m = m['question']
-                d_actual = resultados[i]
+                datos = resultados[i]
                 liquidez_m = int(float(m.get('liquidity', 0)))
                 
-                if d_actual is None: continue
+                # Filtramos si hay error o si la liquidez es 0 (evitar dividir por cero)
+                if datos is None or liquidez_m == 0: continue
+                
+                d_actual = datos['delta']
+                best_bid = datos['best_bid']
+                best_ask = datos['best_ask']
                 
                 if id_m in memoria_deltas:
                     delta_pasado = memoria_deltas[id_m]['delta']
                     cambio = d_actual - delta_pasado
                     
-                    if abs(cambio) >= UMBRAL_ALERTA:
-                        tipo = "🟢 COMPRA MASIVA" if cambio > 0 else "🔴 VENTA MASIVA"
+                    # 🧠 CÁLCULOS INSTITUCIONALES (Microestructura)
+                    mid_price = (best_ask + best_bid) / 2.0
+                    spread_pct = round(((best_ask - best_bid) / mid_price) * 100, 2) if mid_price > 0 else 0
+                    toxicidad_pct = round((abs(cambio) / liquidez_m) * 100, 2)
+                    
+                    # 🎯 LA TRIPLE CONDICIÓN: (Delta >= Umbral) Y (Spread >= Minimo O Toxicidad >= Minimo)
+                    if abs(cambio) >= UMBRAL_ALERTA and (spread_pct >= MIN_SPREAD_PCT or toxicidad_pct >= MIN_TOXICITY_PCT):
                         
-                        # NUEVO FORMATO CON DELTA ANTERIOR
+                        tipo = "🟢 COMPRA INSTITUCIONAL" if cambio > 0 else "🔴 VENTA INSTITUCIONAL"
+                        
                         mensaje_alert = (
-                            f"🚨 *MOVIMIENTO DETECTADO EN MERCADO*\n\n"
+                            f"🚨 *ALERTA DE INSIDER FLOW* 🚨\n\n"
                             f"📌 *{id_m}*\n\n"
                             f"💰 *Cambio de Delta:* `${cambio:,} USD`\n"
                             f"🕰️ *Delta Anterior:* `${delta_pasado:,} USD`\n"
                             f"📊 *Delta Actual:* `${d_actual:,} USD`\n"
                             f"💧 *Liquidez:* `${liquidez_m:,} USD`\n"
                             f"⚖️ *Acción:* {tipo}\n\n"
+                            f"🧠 *Análisis de Microestructura:*\n"
+                            f"📈 *Best Bid / Ask:* `${best_bid:.3f}` / `${best_ask:.3f}`\n"
+                            f"🏃‍♂️ *Urgencia (Spread):* `{spread_pct}%`\n"
+                            f"🌊 *Toxicidad:* `{toxicidad_pct}%`\n\n"
                             f"🔗 [Ver en Polymarket](https://polymarket.com/event/{m['slug']})"
                         )
                         enviar_telegram(mensaje_alert)
+                        
                     memoria_deltas[id_m]['delta'] = d_actual
                 else:
                     memoria_deltas[id_m] = {'delta': d_actual}
