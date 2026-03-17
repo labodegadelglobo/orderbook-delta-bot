@@ -16,15 +16,15 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # ⚙️ CONFIGURACIÓN "FRANCOTIRADOR 5.1" (Ajustables)
 # =========================================================
-UMBRAL_ALERTA = 2000       # Sugerencia: Bajar a 3000 para cazar Inside Info temprano
+UMBRAL_ALERTA = 1000       # Sugerencia: Bajar a 3000 para cazar Inside Info temprano
 MIN_LIQUIDITY = 500        # Sugerencia: Bajar a 500 para ver mercados emergentes
 INTERVALO_ESC_SEG = 300   
 DEPTH_PERCENT = 10.0      
 
 # 🧠 NUEVOS FILTROS DE MICROESTRUCTURA
-MIN_SPREAD_PCT = 2.0       # % Mínimo de hueco (Urgencia) entre comprador y vendedor
-MAX_SPREAD_PCT = 25.0      # % Máximo de hueco (Evita mercados fantasma/rotos)
-MIN_TOXICITY_PCT = 3.0     # % Mínimo del mercado que barrió la ballena (Toxicidad)
+MIN_SPREAD_PCT = 1.0       # % Mínimo de hueco (Urgencia) entre comprador y vendedor
+MAX_SPREAD_PCT = 30.0      # % Máximo de hueco (Evita mercados fantasma/rotos)
+MIN_TOXICITY_PCT = 2.0     # % Mínimo del mercado que barrió la ballena (Toxicidad)
 
 # 🎯 ZONA DE ORO (Filtro de Precios)
 MIN_PRICE = 0.04           # Ignorar mercados casi muertos (menores a 4 centavos)
