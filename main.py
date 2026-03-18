@@ -14,24 +14,23 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # =========================================================
-# ⚙️ CONFIGURACIÓN "FRANCOTIRADOR 5.3" (Doble Vía)
+# ⚙️ CONFIGURACIÓN "FRANCOTIRADOR 5.4" (Filtros Estrictos)
 # =========================================================
-UMBRAL_ALERTA = 1000       # Puerta para movimientos con Spread/Toxicidad
-UMBRAL_BALLENA_TOP = 9000  # Puerta VIP: Si mueve >5k, avisa SIEMPRE
+UMBRAL_ALERTA = 1000       
+UMBRAL_BALLENA_TOP = 11000  
 MIN_LIQUIDITY = 400        
 INTERVALO_ESC_SEG = 300   
 DEPTH_PERCENT = 10.0      
 
-# 🧠 FILTROS DE MICROESTRUCTURA
-MIN_SPREAD_PCT = 1.0       # Urgencia mínima
-MAX_SPREAD_PCT = 35.0      # Evita mercados fantasma
-MIN_TOXICITY_PCT = 2.0     # Impacto mínimo en liquidez
+# 🧠 MICROESTRUCTURA
+MIN_SPREAD_PCT = 2.0       
+MAX_SPREAD_PCT = 30.0      # Filtro estricto: Mayor a esto es un mercado roto
+MIN_TOXICITY_PCT = 3.0     
 
 # 🎯 ZONA DE ORO
 MIN_PRICE = 0.04           
 MAX_PRICE = 0.96           
 
-# Blacklist optimizada (quitamos palabras generales para no filtrar de más)
 blacklist = ['xrp', 'btc', 'eth', 'sol', 'crypto', 'doge', 'pepe']
 
 app = Flask(__name__)
@@ -40,7 +39,7 @@ session = requests.Session()
 
 @app.route('/')
 def home():
-    return f"🛰️ Radar 5.3 Online | Mercados en memoria: {len(memoria_deltas)}", 200
+    return f"🛰️ Radar 5.4 Online | Vigilando: {len(memoria_deltas)}", 200
 
 def enviar_telegram(mensaje):
     ids = [idx.strip() for idx in CHAT_IDS_RAW.split(',') if idx.strip()]
@@ -76,9 +75,8 @@ def calcular_datos_mercado(m):
 
 def bucle_principal():
     global memoria_deltas
-    print("🤖 Radar 5.3: Iniciando sistema...")
-    # Mensaje de confirmación para saber que el bot despertó
-    enviar_telegram("⚡ *Radar 5.3 Online:* Sistema iniciado. Escaneando mercados... (La primera alerta llegará en el próximo ciclo)")
+    print("🤖 Radar 5.4: Iniciando sistema...")
+    enviar_telegram("⚡ *Radar 5.4 Online:* Filtro de Spread Estricto (Máx 25%) activado para TODOS los movimientos.")
 
     while True:
         try:
@@ -107,35 +105,41 @@ def bucle_principal():
                 d_actual = datos['delta']
                 
                 if id_m in memoria_deltas:
-                    cambio = d_actual - memoria_deltas[id_m]['delta']
+                    delta_pasado = memoria_deltas[id_m]['delta']
+                    cambio = d_actual - delta_pasado
                     
                     mid = (datos['best_ask'] + datos['best_bid']) / 2.0
                     spread = round(((datos['best_ask'] - datos['best_bid']) / mid) * 100, 2) if mid > 0 else 0
                     tox = round((abs(cambio) / liquidez_m) * 100, 2)
                     
-                    # 🚀 LÓGICA DE DOBLE VÍA:
-                    # Vía 1: Movimiento Gigante (>5k) -> Pasa directo
-                    # Vía 2: Movimiento Medio (>1.5k) -> Pasa si Spread > 1% o Tox > 2%
-                    es_ballena_top = abs(cambio) >= UMBRAL_BALLENA_TOP
-                    pasa_filtros_micro = abs(cambio) >= UMBRAL_ALERTA and spread <= MAX_SPREAD_PCT and (spread >= MIN_SPREAD_PCT or tox >= MIN_TOXICITY_PCT)
-
-                    if es_ballena_top or pasa_filtros_micro:
-                        tipo = "🟢 COMPRA" if cambio > 0 else "🔴 VENTA"
-                        alerta_emoji = "🐋 BALLENA" if es_ballena_top else "🥷 INSIDER"
+                    # 🛡️ REGLA DE SEGURIDAD TOTAL: Si el spread es > MAX_SPREAD_PCT, ignoramos SIEMPRE.
+                    if spread <= MAX_SPREAD_PCT:
                         
-                        mensaje = (
-                            f"🚨 *ALERTA {alerta_emoji}* 🚨\n\n"
-                            f"📌 *{id_m}*\n\n"
-                            f"💰 *Cambio:* `${cambio:,} USD`\n"
-                            f"📊 *Delta:* `${d_actual:,} USD`\n"
-                            f"💧 *Liq:* `${liquidez_m:,} USD`\n"
-                            f"⚖️ *Acción:* {tipo}\n\n"
-                            f"🧠 *Análisis:*\n"
-                            f"🏷️ *Precio:* `${datos['precio']:.3f}`\n"
-                            f"🏃 *Spread:* `{spread}%` | 🌊 *Tox:* `{tox}%` \n\n"
-                            f"🔗 [Ver en Polymarket](https://polymarket.com/event/{m['slug']})"
-                        )
-                        enviar_telegram(mensaje)
+                        # Vía 1: Ballena (>5k)
+                        es_ballena_top = abs(cambio) >= UMBRAL_BALLENA_TOP
+                        
+                        # Vía 2: Insider (>1.5k + filtros)
+                        pasa_filtros_micro = abs(cambio) >= UMBRAL_ALERTA and (spread >= MIN_SPREAD_PCT or tox >= MIN_TOXICITY_PCT)
+
+                        if es_ballena_top or pasa_filtros_micro:
+                            tipo = "🟢 COMPRA" if cambio > 0 else "🔴 VENTA"
+                            alerta_emoji = "🐋 BALLENA" if es_ballena_top else "🥷 INSIDER"
+                            
+                            mensaje = (
+                                f"🚨 *ALERTA {alerta_emoji}* 🚨\n\n"
+                                f"📌 *{id_m}*\n\n"
+                                f"💰 *Cambio:* `${cambio:,} USD`\n"
+                                f"🕰️ *Delta Anterior:* `${delta_pasado:,} USD`\n"
+                                f"📊 *Delta Actual:* `${d_actual:,} USD`\n"
+                                f"💧 *Liq:* `${liquidez_m:,} USD`\n"
+                                f"⚖️ *Acción:* {tipo}\n\n"
+                                f"🧠 *Análisis:*\n"
+                                f"🏷️ *Precio:* `${datos['precio']:.3f}`\n"
+                                f"📈 *Bid/Ask:* `${datos['best_bid']:.3f}` / `${datos['best_ask']:.3f}`\n"
+                                f"🏃 *Spread:* `{spread}%` | 🌊 *Tox:* `{tox}%` \n\n"
+                                f"🔗 [Ver en Polymarket](https://polymarket.com/event/{m['slug']})"
+                            )
+                            enviar_telegram(mensaje)
                 
                 memoria_deltas[id_m] = {'delta': d_actual}
 
