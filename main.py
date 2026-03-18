@@ -31,7 +31,17 @@ MIN_TOXICITY_PCT = 3.0
 MIN_PRICE = 0.04           
 MAX_PRICE = 0.96           
 
-blacklist = ['xrp', 'btc', 'eth', 'sol', 'crypto', 'doge', 'pepe']
+blacklist = [
+
+    'rounds', 'fight', 'ko', 'tko', 'vs', 'stoppage', 'points', 'rebounds', 
+
+    'assists', 'pts', 'reb', 'ast', 'spread', 'game', 'xrp', 'btc', 
+
+    'eth', 'sol', 'crypto', 'bitcoin', 'ethereum', 'solana', 'doge', 'pepe',
+
+    'nba', 'nfl', 'soccer', 'football', 'ufc', 'boxing', 'tennis', 'mlb', 'nhl'
+
+]
 
 app = Flask(__name__)
 memoria_deltas = {}
