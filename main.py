@@ -16,9 +16,9 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # ⚙️ CONFIGURACIÓN "FRANCOTIRADOR 5.4" (Filtros Estrictos)
 # =========================================================
-UMBRAL_ALERTA = 1000       
-UMBRAL_BALLENA_TOP = 11000  
-MIN_LIQUIDITY = 400        
+UMBRAL_ALERTA = 500       
+UMBRAL_BALLENA_TOP = 5000  
+MIN_LIQUIDITY = 500        
 INTERVALO_ESC_SEG = 300   
 DEPTH_PERCENT = 10.0      
 
