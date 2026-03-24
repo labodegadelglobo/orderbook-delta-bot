@@ -4,6 +4,7 @@ import time
 import os
 import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
 
 # =========================================================
@@ -13,34 +14,29 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # =========================================================
-# 🎚️ FILTROS — AJUSTA ESTOS VALORES A TU GUSTO
+# 🎚️ FILTROS
 # =========================================================
+UMBRAL_BALLENA = 5000
+UMBRAL_INSIDER = 500
+MIN_LIQUIDITY = 500
+MIN_PRICE = 0.04
+MAX_PRICE = 0.96
+MIN_SPREAD_PCT = 2.0
+MAX_SPREAD_PCT = 30.0
+MIN_TOXICITY_PCT = 3.0
+DEPTH_RANGE = 0.10
+INTERVALO_SEG = 300
 
-# --- FILTRO 1: DELTA (cambio en el orderbook en 5 minutos) ---
-UMBRAL_BALLENA = 5000       # Vía Ballena: si el delta cambia $5,000+ → alerta directa
-UMBRAL_INSIDER = 500        # Vía Insider: si el delta cambia $500+ → alerta SI pasa filtros extra
+# ⚡ RENDIMIENTO
+MAX_WORKERS = 3             # Workers simultáneos para leer orderbooks
+BATCH_SIZE = 15             # Mercados por batch antes de pausar
+PAUSA_ENTRE_BATCH = 1.0    # Segundos de pausa entre batches (anti rate-limit)
+MAX_MERCADOS_OFFSET = 10000 # Hasta dónde buscar mercados en Gamma API
 
-# --- FILTRO 2: LIQUIDEZ MÍNIMA ---
-MIN_LIQUIDITY = 500         # Ignorar mercados con menos de $500 de liquidez
+# 🔬 DIAGNÓSTICO
+MODO_DIAGNOSTICO = True
+TOP_N_DIAGNOSTICO = 5
 
-# --- FILTRO 3: PRECIO (Zona de Oro) ---
-MIN_PRICE = 0.04            # Ignorar mercados con precio YES menor a 4 centavos
-MAX_PRICE = 0.96            # Ignorar mercados con precio YES mayor a 96 centavos
-
-# --- FILTRO 4: SPREAD ---
-MIN_SPREAD_PCT = 2.0        # Vía Insider requiere spread ≥ 2% (hay urgencia)
-MAX_SPREAD_PCT = 30.0       # Si spread > 30% → mercado roto, ignorar siempre
-
-# --- FILTRO 5: TOXICIDAD ---
-MIN_TOXICITY_PCT = 3.0      # Vía Insider requiere toxicidad ≥ 3% (hay impacto)
-
-# --- PROFUNDIDAD DEL LIBRO ---
-DEPTH_RANGE = 0.10          # Analizar 10 centavos arriba y abajo del precio
-
-# --- INTERVALO ---
-INTERVALO_SEG = 300         # Escanear cada 5 minutos (300 segundos)
-
-# --- BLACKLIST (mercados a ignorar) ---
 blacklist = [
     'rounds', 'fight', 'ko', 'tko', 'vs', 'stoppage', 'points', 'rebounds',
     'assists', 'pts', 'reb', 'ast', 'spread', 'game', 'xrp', 'btc',
@@ -49,12 +45,11 @@ blacklist = [
 ]
 
 # =========================================================
-# 🧠 MEMORIA PERSISTENTE (sobrevive reinicios de Render)
+# 🧠 MEMORIA PERSISTENTE
 # =========================================================
 MEMORIA_FILE = "/tmp/memoria_deltas.json"
 
 def guardar_memoria(memoria):
-    """Guarda la memoria en disco para no perderla si Render reinicia."""
     try:
         with open(MEMORIA_FILE, 'w') as f:
             json.dump(memoria, f)
@@ -62,7 +57,6 @@ def guardar_memoria(memoria):
         pass
 
 def cargar_memoria():
-    """Carga la memoria guardada. Si no existe, empieza vacía."""
     try:
         if os.path.exists(MEMORIA_FILE):
             with open(MEMORIA_FILE, 'r') as f:
@@ -71,45 +65,45 @@ def cargar_memoria():
                 return data
     except:
         pass
-    print("🧠 Memoria nueva (primer arranque)")
+    print("🧠 Memoria nueva")
     return {}
 
 # =========================================================
 # 🔧 SISTEMA
 # =========================================================
 app = Flask(__name__)
-session = requests.Session()
-session.headers.update({'Accept': 'application/json'})
+session_local = threading.local()
 
-stats = {
-    'ciclos': 0,
-    'alertas': 0,
-    'errores': 0,
-    'ultimo': 'Iniciando...'
-}
+def get_session():
+    """Cada thread tiene su propia sesión HTTP (evita conflictos)."""
+    if not hasattr(session_local, 'session'):
+        s = requests.Session()
+        s.headers.update({'Accept': 'application/json'})
+        session_local.session = s
+    return session_local.session
+
+# Sesión principal para Telegram y Gamma API
+main_session = requests.Session()
+main_session.headers.update({'Accept': 'application/json'})
+
+stats = {'ciclos': 0, 'alertas': 0, 'errores': 0, 'ultimo': 'Iniciando...', 'mercados': 0}
 
 @app.route('/')
 def home():
     return (
-        f"🛰️ Radar 5.5 | Mercados: {stats.get('mercados', 0)} | "
+        f"🛰️ Radar 5.5 | Mercados: {stats['mercados']} | "
         f"Ciclos: {stats['ciclos']} | Alertas: {stats['alertas']} | "
         f"Errores CLOB: {stats['errores']} | Último: {stats['ultimo']}"
     ), 200
 
 
 def enviar_telegram(mensaje):
-    """Envía mensaje a Telegram."""
     ids = [idx.strip() for idx in CHAT_IDS_RAW.split(',') if idx.strip()]
     for cid in ids:
         try:
-            session.post(
+            main_session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={
-                    "chat_id": cid,
-                    "text": mensaje,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": False
-                },
+                data={"chat_id": cid, "text": mensaje, "parse_mode": "Markdown", "disable_web_page_preview": True},
                 timeout=10
             )
         except:
@@ -117,12 +111,10 @@ def enviar_telegram(mensaje):
 
 
 def leer_libro(token_id):
-    """Lee el orderbook de un token. Retorna (bids, asks) o (None, None) si falla."""
+    """Lee orderbook usando sesión del thread actual."""
+    s = get_session()
     try:
-        resp = session.get(
-            f"https://clob.polymarket.com/book?token_id={token_id}",
-            timeout=8
-        )
+        resp = s.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8)
         if resp.status_code == 429:
             time.sleep(3)
             return None, None
@@ -135,56 +127,47 @@ def leer_libro(token_id):
 
 
 def analizar_mercado(m):
-    """
-    Lee los libros YES y NO, calcula el delta combinado.
-    Retorna un diccionario con los datos o None si falla.
-    """
+    """Analiza un mercado leyendo libros YES y NO. Thread-safe."""
     try:
         tokens = json.loads(m.get('clobTokenIds', '[]'))
         prices = json.loads(m.get('outcomePrices', '["0.5","0.5"]'))
-
         if len(tokens) < 2 or len(prices) < 2:
             return None
 
         precio_yes = float(prices[0])
-
-        # FILTRO 3: Zona de Oro
         if precio_yes < MIN_PRICE or precio_yes > MAX_PRICE:
             return None
 
-        # Leer libro YES
+        precio_no = float(prices[1])
+
         bids_yes, asks_yes = leer_libro(tokens[0])
         if bids_yes is None:
             stats['errores'] += 1
             return None
 
-        time.sleep(0.15)  # Pausa para no saturar la API
+        time.sleep(0.1)
 
-        # Leer libro NO
-        precio_no = float(prices[1])
         bids_no, asks_no = leer_libro(tokens[1])
         if bids_no is None:
             stats['errores'] += 1
             return None
 
-        # Calcular delta YES (bids - asks en profundidad de 10¢)
+        # Delta YES
         piso_y = max(0, precio_yes - DEPTH_RANGE)
         techo_y = min(1, precio_yes + DEPTH_RANGE)
         bid_usd_yes = sum(float(b['price']) * float(b['size']) for b in bids_yes if float(b['price']) >= piso_y)
         ask_usd_yes = sum(float(a['price']) * float(a['size']) for a in asks_yes if float(a['price']) <= techo_y)
 
-        # Calcular delta NO
+        # Delta NO
         piso_n = max(0, precio_no - DEPTH_RANGE)
         techo_n = min(1, precio_no + DEPTH_RANGE)
         bid_usd_no = sum(float(b['price']) * float(b['size']) for b in bids_no if float(b['price']) >= piso_n)
         ask_usd_no = sum(float(a['price']) * float(a['size']) for a in asks_no if float(a['price']) <= techo_n)
 
-        # Delta combinado: positivo = presión compradora YES, negativo = vendedora
         delta_yes = bid_usd_yes - ask_usd_yes
         delta_no = bid_usd_no - ask_usd_no
         delta_total = int(delta_yes - delta_no)
 
-        # Best bid/ask para calcular spread
         best_bid = float(bids_yes[0]['price']) if bids_yes else 0.0
         best_ask = float(asks_yes[0]['price']) if asks_yes else 1.0
 
@@ -196,155 +179,181 @@ def analizar_mercado(m):
             'delta_yes': int(delta_yes),
             'delta_no': int(delta_no)
         }
-
-    except Exception as e:
-        print(f"⚠️ Error en '{m.get('question', '?')[:40]}': {e}")
+    except:
         stats['errores'] += 1
         return None
+
+
+def analizar_batch(batch):
+    """Procesa un batch de mercados con workers en paralelo."""
+    resultados = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futuros = {executor.submit(analizar_mercado, m): m for m in batch}
+        for futuro in as_completed(futuros):
+            m = futuros[futuro]
+            try:
+                dato = futuro.result()
+            except:
+                dato = None
+            resultados.append((m, dato))
+    return resultados
+
+
+def obtener_todos_mercados():
+    """Obtiene todos los mercados activos de Gamma API."""
+    all_markets = []
+    offset = 0
+    while offset < MAX_MERCADOS_OFFSET:
+        try:
+            data = main_session.get(
+                f"https://gamma-api.polymarket.com/markets?"
+                f"active=true&closed=false&limit=100&offset={offset}"
+                f"&order=liquidity&ascending=false",
+                timeout=15
+            ).json()
+        except:
+            break
+        if not data:
+            break
+        all_markets.extend(data)
+        offset += 100
+        time.sleep(0.05)
+    return all_markets
 
 
 def bucle_principal():
     memoria = cargar_memoria()
 
     print("🤖 Radar 5.5 arrancando...")
+    modo_txt = "🔬 DIAGNÓSTICO" if MODO_DIAGNOSTICO else "🎯 Producción"
     enviar_telegram(
-        f"⚡ *Radar 5.5 Online*\n\n"
-        f"🎚️ *Filtros activos:*\n"
-        f"🐋 Ballena: ≥ ${UMBRAL_BALLENA:,}\n"
-        f"🥷 Insider: ≥ ${UMBRAL_INSIDER:,} + Spread ≥{MIN_SPREAD_PCT}% ó Tox ≥{MIN_TOXICITY_PCT}%\n"
-        f"💧 Liquidez mín: ${MIN_LIQUIDITY:,}\n"
-        f"🏷️ Precio: ${MIN_PRICE} - ${MAX_PRICE}\n"
-        f"🚫 Spread máx: {MAX_SPREAD_PCT}%\n"
-        f"⏱️ Escaneo cada {INTERVALO_SEG}s\n"
-        f"🧠 Memoria: {len(memoria)} mercados recuperados"
+        f"⚡ *Radar 5.5 Online* — {modo_txt}\n\n"
+        f"🐋 Ballena: ≥${UMBRAL_BALLENA:,} | 🥷 Insider: ≥${UMBRAL_INSIDER:,}\n"
+        f"💧 Liq mín: ${MIN_LIQUIDITY:,} | 🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
+        f"🏃 Spread: {MIN_SPREAD_PCT}%-{MAX_SPREAD_PCT}% | 🌊 Tox: ≥{MIN_TOXICITY_PCT}%\n"
+        f"⚡ Workers: {MAX_WORKERS} | Batch: {BATCH_SIZE} | Offset: {MAX_MERCADOS_OFFSET}\n"
+        f"🧠 Memoria: {len(memoria)} mercados"
     )
 
     while True:
         try:
             inicio = time.time()
 
-            # ── Paso 1: Obtener mercados activos ──
-            all_markets = []
-            offset = 0
-            while offset < 5000:
-                try:
-                    data = session.get(
-                        f"https://gamma-api.polymarket.com/markets?"
-                        f"active=true&closed=false&limit=100&offset={offset}"
-                        f"&order=liquidity&ascending=false",
-                        timeout=15
-                    ).json()
-                except:
-                    break
-                if not data:
-                    break
-                all_markets.extend(data)
-                offset += 100
-                time.sleep(0.1)
+            # ── Paso 1: Obtener TODOS los mercados ──
+            all_markets = obtener_todos_mercados()
 
-            # ── Paso 2: Aplicar filtros básicos ──
-            # FILTRO 2: Liquidez mínima + Blacklist
+            # ── Paso 2: Filtrar ──
             mercados = [
                 m for m in all_markets
                 if float(m.get('liquidity', 0)) >= MIN_LIQUIDITY
                 and not any(w in m.get('question', '').lower() for w in blacklist)
             ]
 
-            print(f"📡 Total: {len(all_markets)} | Filtrados: {len(mercados)}")
+            print(f"📡 Total Gamma: {len(all_markets)} | Post-filtro: {len(mercados)}")
 
-            # ── Paso 3: Analizar cada mercado ──
+            # ── Paso 3: Procesar en batches ──
             alertas_ciclo = 0
             ok_count = 0
+            todos_cambios = []
 
-            for m in mercados:
-                nombre = m['question']
-                liquidez = int(float(m.get('liquidity', 0)))
-                datos = analizar_mercado(m)
+            for batch_start in range(0, len(mercados), BATCH_SIZE):
+                batch = mercados[batch_start:batch_start + BATCH_SIZE]
+                resultados_batch = analizar_batch(batch)
 
-                if datos is None:
-                    continue
+                for m, datos in resultados_batch:
+                    nombre = m['question']
+                    liquidez = int(float(m.get('liquidity', 0)))
 
-                ok_count += 1
-                d_actual = datos['delta']
-
-                # Si ya lo tenemos en memoria, comparar
-                if nombre in memoria:
-                    d_pasado = memoria[nombre]['delta']
-                    cambio = d_actual - d_pasado
-
-                    # Sin cambio → siguiente
-                    if cambio == 0:
-                        memoria[nombre] = {'delta': d_actual}
+                    if datos is None:
                         continue
 
-                    # Calcular spread
-                    mid = (datos['best_ask'] + datos['best_bid']) / 2.0
-                    spread = round(((datos['best_ask'] - datos['best_bid']) / mid) * 100, 2) if mid > 0 else 0
+                    ok_count += 1
+                    d_actual = datos['delta']
 
-                    # Calcular toxicidad
-                    tox = round((abs(cambio) / liquidez) * 100, 2) if liquidez > 0 else 0
+                    if nombre in memoria:
+                        d_pasado = memoria[nombre]['delta']
+                        cambio = d_actual - d_pasado
 
-                    # ═══════════════════════════════════════
-                    # 🎯 LÓGICA DE ALERTAS (Doble Vía)
-                    # ═══════════════════════════════════════
+                        if cambio == 0:
+                            memoria[nombre] = {'delta': d_actual}
+                            continue
 
-                    # FILTRO 4: Spread máximo → mercado roto
-                    if spread > MAX_SPREAD_PCT:
-                        memoria[nombre] = {'delta': d_actual}
-                        continue
+                        mid = (datos['best_ask'] + datos['best_bid']) / 2.0
+                        spread = round(((datos['best_ask'] - datos['best_bid']) / mid) * 100, 2) if mid > 0 else 0
+                        tox = round((abs(cambio) / liquidez) * 100, 2) if liquidez > 0 else 0
 
-                    # VÍA 1: 🐋 BALLENA
-                    # Cambio ≥ $5,000 → alerta directa (solo necesita spread ≤ 30%)
-                    es_ballena = abs(cambio) >= UMBRAL_BALLENA
+                        # Diagnóstico
+                        if MODO_DIAGNOSTICO:
+                            entry = {
+                                'nombre': nombre[:60],
+                                'cambio': cambio,
+                                'abs_cambio': abs(cambio),
+                                'spread': spread,
+                                'tox': tox,
+                                'liquidez': liquidez,
+                                'precio': datos['precio'],
+                                'bloqueado_por': []
+                            }
+                            if spread > MAX_SPREAD_PCT:
+                                entry['bloqueado_por'].append(f"Spread {spread}%>{MAX_SPREAD_PCT}%")
+                            elif abs(cambio) >= UMBRAL_BALLENA:
+                                pass
+                            elif abs(cambio) >= UMBRAL_INSIDER:
+                                if spread < MIN_SPREAD_PCT and tox < MIN_TOXICITY_PCT:
+                                    entry['bloqueado_por'].append(f"Spr {spread}%<{MIN_SPREAD_PCT}% Y Tox {tox}%<{MIN_TOXICITY_PCT}%")
+                            else:
+                                entry['bloqueado_por'].append(f"Delta ${abs(cambio)}<${UMBRAL_INSIDER}")
+                            todos_cambios.append(entry)
 
-                    # VÍA 2: 🥷 INSIDER
-                    # Cambio ≥ $500 Y (spread ≥ 2% Ó toxicidad ≥ 3%)
-                    es_insider = (
-                        abs(cambio) >= UMBRAL_INSIDER
-                        and (spread >= MIN_SPREAD_PCT or tox >= MIN_TOXICITY_PCT)
-                    )
+                        # ═══ ALERTAS ═══
+                        if spread > MAX_SPREAD_PCT:
+                            memoria[nombre] = {'delta': d_actual}
+                            continue
 
-                    if es_ballena or es_insider:
-                        tipo = "🟢 COMPRA" if cambio > 0 else "🔴 VENTA"
-                        etiqueta = "🐋 BALLENA" if es_ballena else "🥷 INSIDER"
-
-                        # Explicar por qué pasó los filtros
-                        if es_ballena:
-                            razon = f"Delta ≥ ${UMBRAL_BALLENA:,}"
-                        else:
-                            razones = []
-                            if spread >= MIN_SPREAD_PCT:
-                                razones.append(f"Spread {spread}% ≥ {MIN_SPREAD_PCT}%")
-                            if tox >= MIN_TOXICITY_PCT:
-                                razones.append(f"Tox {tox}% ≥ {MIN_TOXICITY_PCT}%")
-                            razon = " + ".join(razones)
-
-                        mensaje = (
-                            f"🚨 *ALERTA {etiqueta}* 🚨\n\n"
-                            f"📌 *{nombre}*\n\n"
-                            f"💰 *Cambio:* `${cambio:,}`\n"
-                            f"🕰️ *Delta Ant:* `${d_pasado:,}` → *Actual:* `${d_actual:,}`\n"
-                            f"   ├ YES: `${datos['delta_yes']:,}` | NO: `${datos['delta_no']:,}`\n"
-                            f"💧 *Liquidez:* `${liquidez:,}`\n"
-                            f"⚖️ *Acción:* {tipo}\n\n"
-                            f"🧠 *Microestructura:*\n"
-                            f"🏷️ Precio: `${datos['precio']:.3f}`\n"
-                            f"📈 Bid/Ask: `${datos['best_bid']:.3f}` / `${datos['best_ask']:.3f}`\n"
-                            f"🏃 Spread: `{spread}%` | 🌊 Tox: `{tox}%`\n"
-                            f"✅ *Razón:* {razon}\n\n"
-                            f"🔗 [Ver en Polymarket](https://polymarket.com/event/{m.get('slug', '')})"
+                        es_ballena = abs(cambio) >= UMBRAL_BALLENA
+                        es_insider = (
+                            abs(cambio) >= UMBRAL_INSIDER
+                            and (spread >= MIN_SPREAD_PCT or tox >= MIN_TOXICITY_PCT)
                         )
-                        enviar_telegram(mensaje)
-                        alertas_ciclo += 1
-                        stats['alertas'] += 1
 
-                # Guardar delta actual
-                memoria[nombre] = {'delta': d_actual}
+                        if es_ballena or es_insider:
+                            tipo = "🟢 COMPRA" if cambio > 0 else "🔴 VENTA"
+                            etiqueta = "🐋 BALLENA" if es_ballena else "🥷 INSIDER"
 
-                # Pausa entre mercados
-                time.sleep(0.1)
+                            if es_ballena:
+                                razon = f"Delta ≥ ${UMBRAL_BALLENA:,}"
+                            else:
+                                razones = []
+                                if spread >= MIN_SPREAD_PCT:
+                                    razones.append(f"Spr {spread}%≥{MIN_SPREAD_PCT}%")
+                                if tox >= MIN_TOXICITY_PCT:
+                                    razones.append(f"Tox {tox}%≥{MIN_TOXICITY_PCT}%")
+                                razon = " + ".join(razones)
 
-            # ── Guardar memoria a disco ──
+                            mensaje = (
+                                f"🚨 *ALERTA {etiqueta}* 🚨\n\n"
+                                f"📌 *{nombre}*\n\n"
+                                f"💰 *Cambio:* `${cambio:,}`\n"
+                                f"🕰️ *Delta:* `${d_pasado:,}` → `${d_actual:,}`\n"
+                                f"   ├ YES: `${datos['delta_yes']:,}` | NO: `${datos['delta_no']:,}`\n"
+                                f"💧 *Liquidez:* `${liquidez:,}`\n"
+                                f"⚖️ *Acción:* {tipo}\n\n"
+                                f"🏷️ Precio: `${datos['precio']:.3f}`\n"
+                                f"📈 Bid/Ask: `${datos['best_bid']:.3f}` / `${datos['best_ask']:.3f}`\n"
+                                f"🏃 Spread: `{spread}%` | 🌊 Tox: `{tox}%`\n"
+                                f"✅ *Razón:* {razon}\n\n"
+                                f"🔗 [Ver en Polymarket](https://polymarket.com/event/{m.get('slug', '')})"
+                            )
+                            enviar_telegram(mensaje)
+                            alertas_ciclo += 1
+                            stats['alertas'] += 1
+
+                    memoria[nombre] = {'delta': d_actual}
+
+                # Pausa entre batches
+                time.sleep(PAUSA_ENTRE_BATCH)
+
+            # ── Guardar memoria ──
             guardar_memoria(memoria)
 
             # ── Stats ──
@@ -355,26 +364,57 @@ def bucle_principal():
 
             print(
                 f"✅ Ciclo #{stats['ciclos']} ({duracion}s) | "
-                f"OK: {ok_count}/{len(mercados)} | "
-                f"Alertas: {alertas_ciclo} | "
-                f"Memoria: {len(memoria)}"
+                f"Libros OK: {ok_count}/{len(mercados)} | Alertas: {alertas_ciclo}"
             )
 
-            # Diagnóstico cada 12 ciclos (~1 hora)
+            # ── Diagnóstico ──
+            if MODO_DIAGNOSTICO and todos_cambios and stats['ciclos'] >= 2:
+                todos_cambios.sort(key=lambda x: x['abs_cambio'], reverse=True)
+                top = todos_cambios[:TOP_N_DIAGNOSTICO]
+
+                lineas = [f"🔬 *DIAG #{stats['ciclos']}* ({duracion}s)\n"]
+                lineas.append(f"📡 OK: {ok_count}/{len(mercados)} | Mov: {len(todos_cambios)}\n")
+
+                for j, t in enumerate(top, 1):
+                    d = "🟢" if t['cambio'] > 0 else "🔴"
+                    bloq = " | ".join(t['bloqueado_por']) if t['bloqueado_por'] else "✅ PASÓ"
+                    lineas.append(
+                        f"\n*{j}. {t['nombre']}*\n"
+                        f"   {d} `${t['cambio']:,}` | Liq: `${t['liquidez']:,}`\n"
+                        f"   Spr: `{t['spread']}%` | Tox: `{t['tox']}%`\n"
+                        f"   → _{bloq}_"
+                    )
+
+                total_bloq = sum(1 for t in todos_cambios if t['bloqueado_por'])
+                total_delta = sum(1 for t in todos_cambios if any('Delta' in b for b in t['bloqueado_por']))
+                total_spr = sum(1 for t in todos_cambios if any('>' in b for b in t['bloqueado_por']))
+                total_micro = sum(1 for t in todos_cambios if any('Y Tox' in b for b in t['bloqueado_por']))
+
+                lineas.append(
+                    f"\n\n📈 *Filtros:*\n"
+                    f"Total: {len(todos_cambios)} | Bloq: {total_bloq}\n"
+                    f"├ Delta bajo: {total_delta}\n"
+                    f"├ Spread roto: {total_spr}\n"
+                    f"└ Sin urgencia: {total_micro}\n"
+                    f"✅ Pasaron: {len(todos_cambios) - total_bloq}"
+                )
+
+                enviar_telegram("\n".join(lineas))
+
             if stats['ciclos'] % 12 == 0:
                 enviar_telegram(
-                    f"📊 *Diagnóstico #{stats['ciclos']}*\n"
+                    f"📊 *Reporte #{stats['ciclos']}*\n"
                     f"👁️ Mercados: {len(memoria)}\n"
-                    f"📡 Libros OK: {ok_count}/{len(mercados)}\n"
-                    f"🚨 Alertas total: {stats['alertas']}\n"
-                    f"❌ Errores CLOB: {stats['errores']}\n"
+                    f"📡 OK: {ok_count}/{len(mercados)}\n"
+                    f"🚨 Alertas: {stats['alertas']}\n"
+                    f"❌ Errores: {stats['errores']}\n"
                     f"⏱️ Ciclo: {duracion}s"
                 )
 
             time.sleep(INTERVALO_SEG)
 
         except Exception as e:
-            print(f"❌ Error principal: {e}")
+            print(f"❌ Error: {e}")
             import traceback
             traceback.print_exc()
             time.sleep(60)
