@@ -27,10 +27,10 @@ MIN_TOXICITY_PCT = 3.0
 DEPTH_RANGE = 0.10
 INTERVALO_SEG = 300
 
-# ⚡ RENDIMIENTO (optimizado para Render Free)
-MAX_WORKERS = 2             # Solo 2 workers para no saturar CPU de Render Free
-BATCH_SIZE = 10             # Batches más pequeños
-PAUSA_ENTRE_BATCH = 1.5    # Más pausa entre batches
+# ⚡ RENDIMIENTO
+MAX_WORKERS = 2
+BATCH_SIZE = 10
+PAUSA_ENTRE_BATCH = 1.5
 MAX_MERCADOS_OFFSET = 10000
 
 # 🔬 DIAGNÓSTICO
@@ -45,7 +45,7 @@ blacklist = [
 ]
 
 # =========================================================
-# 🧠 MEMORIA PERSISTENTE
+# 🧠 MEMORIA
 # =========================================================
 MEMORIA_FILE = "/tmp/memoria_deltas.json"
 
@@ -69,7 +69,7 @@ def cargar_memoria():
     return {}
 
 # =========================================================
-# 🔧 FLASK APP (debe arrancar RÁPIDO para que Render no de 503)
+# 🔧 FLASK
 # =========================================================
 app = Flask(__name__)
 
@@ -81,7 +81,6 @@ stats = {
 
 @app.route('/')
 def home():
-    """Health check - debe responder siempre, incluso si el bot está escaneando."""
     return (
         f"🛰️ Radar 5.5 | {stats['estado']}\n"
         f"Mercados: {stats['mercados']} | Ciclos: {stats['ciclos']} | "
@@ -91,11 +90,10 @@ def home():
 
 @app.route('/health')
 def health():
-    """Health check mínimo para Render."""
     return "OK", 200
 
 # =========================================================
-# 🔧 SESIONES HTTP
+# 🔧 HTTP
 # =========================================================
 session_local = threading.local()
 
@@ -229,12 +227,8 @@ def obtener_todos_mercados():
 
 
 def bucle_principal():
-    # Esperar 5 segundos para que Flask arranque primero
-    time.sleep(5)
-
+    print("🤖 Radar 5.5: Thread del bot iniciado correctamente", flush=True)
     memoria = cargar_memoria()
-
-    print("🤖 Radar 5.5 arrancando...")
     stats['estado'] = '✅ Activo'
 
     enviar_telegram(
@@ -251,19 +245,16 @@ def bucle_principal():
             inicio = time.time()
             stats['estado'] = '🔄 Escaneando...'
 
-            # Paso 1: Obtener mercados
             all_markets = obtener_todos_mercados()
 
-            # Paso 2: Filtrar
             mercados = [
                 m for m in all_markets
                 if float(m.get('liquidity', 0)) >= MIN_LIQUIDITY
                 and not any(w in m.get('question', '').lower() for w in blacklist)
             ]
 
-            print(f"📡 Total: {len(all_markets)} | Filtrados: {len(mercados)}")
+            print(f"📡 Total: {len(all_markets)} | Filtrados: {len(mercados)}", flush=True)
 
-            # Paso 3: Procesar en batches
             alertas_ciclo = 0
             ok_count = 0
             todos_cambios = []
@@ -316,7 +307,6 @@ def bucle_principal():
                                 entry['bloqueado_por'].append(f"Delta ${abs(cambio)}<${UMBRAL_INSIDER}")
                             todos_cambios.append(entry)
 
-                        # ═══ ALERTAS ═══
                         if spread > MAX_SPREAD_PCT:
                             memoria[nombre] = {'delta': d_actual}
                             continue
@@ -361,25 +351,18 @@ def bucle_principal():
 
                     memoria[nombre] = {'delta': d_actual}
 
-                # Pausa entre batches
                 time.sleep(PAUSA_ENTRE_BATCH)
 
-            # Guardar memoria
             guardar_memoria(memoria)
 
-            # Stats
             stats['ciclos'] += 1
             stats['mercados'] = len(memoria)
             duracion = round(time.time() - inicio, 1)
             stats['ultimo'] = datetime.now().strftime('%H:%M:%S')
-            stats['estado'] = f'✅ Activo (último ciclo: {duracion}s)'
+            stats['estado'] = f'✅ Activo ({duracion}s)'
 
-            print(
-                f"✅ Ciclo #{stats['ciclos']} ({duracion}s) | "
-                f"OK: {ok_count}/{len(mercados)} | Alertas: {alertas_ciclo}"
-            )
+            print(f"✅ Ciclo #{stats['ciclos']} ({duracion}s) | OK: {ok_count}/{len(mercados)} | Alertas: {alertas_ciclo}", flush=True)
 
-            # Diagnóstico
             if MODO_DIAGNOSTICO and todos_cambios and stats['ciclos'] >= 2:
                 todos_cambios.sort(key=lambda x: x['abs_cambio'], reverse=True)
                 top = todos_cambios[:TOP_N_DIAGNOSTICO]
@@ -426,20 +409,31 @@ def bucle_principal():
             time.sleep(INTERVALO_SEG)
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Error: {e}", flush=True)
             import traceback
             traceback.print_exc()
+            stats['estado'] = f'❌ Error: {str(e)[:50]}'
             time.sleep(60)
 
 
 # =========================================================
-# 🚀 ARRANQUE
+# 🚀 ARRANQUE — Compatible con gunicorn Y python directo
 # =========================================================
-# Iniciar el bot en un thread separado ANTES de que gunicorn/flask arranque
-bot_thread = threading.Thread(target=bucle_principal, daemon=True)
-bot_thread.start()
+bot_iniciado = False
+bot_lock = threading.Lock()
 
-# Para gunicorn: gunicorn main:app
-# Para desarrollo local: python main.py
+def iniciar_bot():
+    global bot_iniciado
+    with bot_lock:
+        if not bot_iniciado:
+            bot_iniciado = True
+            t = threading.Thread(target=bucle_principal, daemon=True)
+            t.start()
+            print("🚀 Bot thread lanzado", flush=True)
+
+# Esto se ejecuta cuando gunicorn importa el módulo
+iniciar_bot()
+
+# Esto solo se ejecuta si corres "python main.py" directamente
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
