@@ -61,11 +61,11 @@ def cargar_memoria():
         if os.path.exists(MEMORIA_FILE):
             with open(MEMORIA_FILE, 'r') as f:
                 data = json.load(f)
-                print(f"🧠 Memoria recuperada: {len(data)} mercados")
+                print(f"🧠 Memoria recuperada: {len(data)} mercados", flush=True)
                 return data
     except:
         pass
-    print("🧠 Memoria nueva")
+    print("🧠 Memoria nueva", flush=True)
     return {}
 
 # =========================================================
@@ -161,11 +161,32 @@ def analizar_mercado(m):
             stats['errores'] += 1
             return None
 
+        # ══════════════════════════════════════════════
+        # FIX CRÍTICO: Validar que el libro tenga órdenes reales
+        # Si no hay bids O no hay asks en YES, no podemos calcular
+        # spread real y el mercado no es operable.
+        # ══════════════════════════════════════════════
+        if not bids_yes or not asks_yes:
+            return None
+
+        best_bid = float(bids_yes[0]['price'])
+        best_ask = float(asks_yes[0]['price'])
+
+        # Validar que bid < ask (libro coherente)
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            return None
+
+        # Calcular spread REAL con órdenes verificadas
+        mid = (best_ask + best_bid) / 2.0
+        spread = round(((best_ask - best_bid) / mid) * 100, 2)
+
+        # Delta YES
         piso_y = max(0, precio_yes - DEPTH_RANGE)
         techo_y = min(1, precio_yes + DEPTH_RANGE)
         bid_usd_yes = sum(float(b['price']) * float(b['size']) for b in bids_yes if float(b['price']) >= piso_y)
         ask_usd_yes = sum(float(a['price']) * float(a['size']) for a in asks_yes if float(a['price']) <= techo_y)
 
+        # Delta NO
         piso_n = max(0, precio_no - DEPTH_RANGE)
         techo_n = min(1, precio_no + DEPTH_RANGE)
         bid_usd_no = sum(float(b['price']) * float(b['size']) for b in bids_no if float(b['price']) >= piso_n)
@@ -175,13 +196,11 @@ def analizar_mercado(m):
         delta_no = bid_usd_no - ask_usd_no
         delta_total = int(delta_yes - delta_no)
 
-        best_bid = float(bids_yes[0]['price']) if bids_yes else 0.0
-        best_ask = float(asks_yes[0]['price']) if asks_yes else 1.0
-
         return {
             'delta': delta_total,
             'best_bid': best_bid,
             'best_ask': best_ask,
+            'spread': spread,
             'precio': precio_yes,
             'delta_yes': int(delta_yes),
             'delta_no': int(delta_no)
@@ -227,7 +246,7 @@ def obtener_todos_mercados():
 
 
 def bucle_principal():
-    print("🤖 Radar 5.5: Thread del bot iniciado correctamente", flush=True)
+    print("🤖 Radar 5.5: Bot iniciado", flush=True)
     memoria = cargar_memoria()
     stats['estado'] = '✅ Activo'
 
@@ -237,7 +256,8 @@ def bucle_principal():
         f"💧 Liq: ${MIN_LIQUIDITY:,} | 🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
         f"🏃 Spread: {MIN_SPREAD_PCT}%-{MAX_SPREAD_PCT}% | 🌊 Tox: ≥{MIN_TOXICITY_PCT}%\n"
         f"⚡ Workers: {MAX_WORKERS} | Batch: {BATCH_SIZE}\n"
-        f"🧠 Memoria: {len(memoria)}"
+        f"🧠 Memoria: {len(memoria)}\n"
+        f"🔧 FIX: Spread ahora se calcula con órdenes reales"
     )
 
     while True:
@@ -272,6 +292,7 @@ def bucle_principal():
 
                     ok_count += 1
                     d_actual = datos['delta']
+                    spread = datos['spread']  # Spread ya calculado y validado
 
                     if nombre in memoria:
                         d_pasado = memoria[nombre]['delta']
@@ -281,8 +302,6 @@ def bucle_principal():
                             memoria[nombre] = {'delta': d_actual}
                             continue
 
-                        mid = (datos['best_ask'] + datos['best_bid']) / 2.0
-                        spread = round(((datos['best_ask'] - datos['best_bid']) / mid) * 100, 2) if mid > 0 else 0
                         tox = round((abs(cambio) / liquidez) * 100, 2) if liquidez > 0 else 0
 
                         if MODO_DIAGNOSTICO:
@@ -307,6 +326,7 @@ def bucle_principal():
                                 entry['bloqueado_por'].append(f"Delta ${abs(cambio)}<${UMBRAL_INSIDER}")
                             todos_cambios.append(entry)
 
+                        # ═══ ALERTAS ═══
                         if spread > MAX_SPREAD_PCT:
                             memoria[nombre] = {'delta': d_actual}
                             continue
@@ -417,7 +437,7 @@ def bucle_principal():
 
 
 # =========================================================
-# 🚀 ARRANQUE — Compatible con gunicorn Y python directo
+# 🚀 ARRANQUE
 # =========================================================
 bot_iniciado = False
 bot_lock = threading.Lock()
@@ -431,9 +451,7 @@ def iniciar_bot():
             t.start()
             print("🚀 Bot thread lanzado", flush=True)
 
-# Esto se ejecuta cuando gunicorn importa el módulo
 iniciar_bot()
 
-# Esto solo se ejecuta si corres "python main.py" directamente
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
