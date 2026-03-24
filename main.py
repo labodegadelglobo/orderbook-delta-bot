@@ -27,11 +27,11 @@ MIN_TOXICITY_PCT = 3.0
 DEPTH_RANGE = 0.10
 INTERVALO_SEG = 300
 
-# ⚡ RENDIMIENTO
-MAX_WORKERS = 3             # Workers simultáneos para leer orderbooks
-BATCH_SIZE = 15             # Mercados por batch antes de pausar
-PAUSA_ENTRE_BATCH = 1.0    # Segundos de pausa entre batches (anti rate-limit)
-MAX_MERCADOS_OFFSET = 10000 # Hasta dónde buscar mercados en Gamma API
+# ⚡ RENDIMIENTO (optimizado para Render Free)
+MAX_WORKERS = 2             # Solo 2 workers para no saturar CPU de Render Free
+BATCH_SIZE = 10             # Batches más pequeños
+PAUSA_ENTRE_BATCH = 1.5    # Más pausa entre batches
+MAX_MERCADOS_OFFSET = 10000
 
 # 🔬 DIAGNÓSTICO
 MODO_DIAGNOSTICO = True
@@ -69,32 +69,45 @@ def cargar_memoria():
     return {}
 
 # =========================================================
-# 🔧 SISTEMA
+# 🔧 FLASK APP (debe arrancar RÁPIDO para que Render no de 503)
 # =========================================================
 app = Flask(__name__)
+
+stats = {
+    'ciclos': 0, 'alertas': 0, 'errores': 0,
+    'ultimo': 'Iniciando...', 'mercados': 0,
+    'estado': '⏳ Arrancando...'
+}
+
+@app.route('/')
+def home():
+    """Health check - debe responder siempre, incluso si el bot está escaneando."""
+    return (
+        f"🛰️ Radar 5.5 | {stats['estado']}\n"
+        f"Mercados: {stats['mercados']} | Ciclos: {stats['ciclos']} | "
+        f"Alertas: {stats['alertas']} | Errores: {stats['errores']} | "
+        f"Último: {stats['ultimo']}"
+    ), 200
+
+@app.route('/health')
+def health():
+    """Health check mínimo para Render."""
+    return "OK", 200
+
+# =========================================================
+# 🔧 SESIONES HTTP
+# =========================================================
 session_local = threading.local()
 
 def get_session():
-    """Cada thread tiene su propia sesión HTTP (evita conflictos)."""
     if not hasattr(session_local, 'session'):
         s = requests.Session()
         s.headers.update({'Accept': 'application/json'})
         session_local.session = s
     return session_local.session
 
-# Sesión principal para Telegram y Gamma API
 main_session = requests.Session()
 main_session.headers.update({'Accept': 'application/json'})
-
-stats = {'ciclos': 0, 'alertas': 0, 'errores': 0, 'ultimo': 'Iniciando...', 'mercados': 0}
-
-@app.route('/')
-def home():
-    return (
-        f"🛰️ Radar 5.5 | Mercados: {stats['mercados']} | "
-        f"Ciclos: {stats['ciclos']} | Alertas: {stats['alertas']} | "
-        f"Errores CLOB: {stats['errores']} | Último: {stats['ultimo']}"
-    ), 200
 
 
 def enviar_telegram(mensaje):
@@ -111,7 +124,6 @@ def enviar_telegram(mensaje):
 
 
 def leer_libro(token_id):
-    """Lee orderbook usando sesión del thread actual."""
     s = get_session()
     try:
         resp = s.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=8)
@@ -127,7 +139,6 @@ def leer_libro(token_id):
 
 
 def analizar_mercado(m):
-    """Analiza un mercado leyendo libros YES y NO. Thread-safe."""
     try:
         tokens = json.loads(m.get('clobTokenIds', '[]'))
         prices = json.loads(m.get('outcomePrices', '["0.5","0.5"]'))
@@ -152,13 +163,11 @@ def analizar_mercado(m):
             stats['errores'] += 1
             return None
 
-        # Delta YES
         piso_y = max(0, precio_yes - DEPTH_RANGE)
         techo_y = min(1, precio_yes + DEPTH_RANGE)
         bid_usd_yes = sum(float(b['price']) * float(b['size']) for b in bids_yes if float(b['price']) >= piso_y)
         ask_usd_yes = sum(float(a['price']) * float(a['size']) for a in asks_yes if float(a['price']) <= techo_y)
 
-        # Delta NO
         piso_n = max(0, precio_no - DEPTH_RANGE)
         techo_n = min(1, precio_no + DEPTH_RANGE)
         bid_usd_no = sum(float(b['price']) * float(b['size']) for b in bids_no if float(b['price']) >= piso_n)
@@ -185,7 +194,6 @@ def analizar_mercado(m):
 
 
 def analizar_batch(batch):
-    """Procesa un batch de mercados con workers en paralelo."""
     resultados = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futuros = {executor.submit(analizar_mercado, m): m for m in batch}
@@ -200,7 +208,6 @@ def analizar_batch(batch):
 
 
 def obtener_todos_mercados():
-    """Obtiene todos los mercados activos de Gamma API."""
     all_markets = []
     offset = 0
     while offset < MAX_MERCADOS_OFFSET:
@@ -222,36 +229,41 @@ def obtener_todos_mercados():
 
 
 def bucle_principal():
+    # Esperar 5 segundos para que Flask arranque primero
+    time.sleep(5)
+
     memoria = cargar_memoria()
 
     print("🤖 Radar 5.5 arrancando...")
-    modo_txt = "🔬 DIAGNÓSTICO" if MODO_DIAGNOSTICO else "🎯 Producción"
+    stats['estado'] = '✅ Activo'
+
     enviar_telegram(
-        f"⚡ *Radar 5.5 Online* — {modo_txt}\n\n"
+        f"⚡ *Radar 5.5 Online* — {'🔬 DIAG' if MODO_DIAGNOSTICO else '🎯 PROD'}\n\n"
         f"🐋 Ballena: ≥${UMBRAL_BALLENA:,} | 🥷 Insider: ≥${UMBRAL_INSIDER:,}\n"
-        f"💧 Liq mín: ${MIN_LIQUIDITY:,} | 🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
+        f"💧 Liq: ${MIN_LIQUIDITY:,} | 🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
         f"🏃 Spread: {MIN_SPREAD_PCT}%-{MAX_SPREAD_PCT}% | 🌊 Tox: ≥{MIN_TOXICITY_PCT}%\n"
-        f"⚡ Workers: {MAX_WORKERS} | Batch: {BATCH_SIZE} | Offset: {MAX_MERCADOS_OFFSET}\n"
-        f"🧠 Memoria: {len(memoria)} mercados"
+        f"⚡ Workers: {MAX_WORKERS} | Batch: {BATCH_SIZE}\n"
+        f"🧠 Memoria: {len(memoria)}"
     )
 
     while True:
         try:
             inicio = time.time()
+            stats['estado'] = '🔄 Escaneando...'
 
-            # ── Paso 1: Obtener TODOS los mercados ──
+            # Paso 1: Obtener mercados
             all_markets = obtener_todos_mercados()
 
-            # ── Paso 2: Filtrar ──
+            # Paso 2: Filtrar
             mercados = [
                 m for m in all_markets
                 if float(m.get('liquidity', 0)) >= MIN_LIQUIDITY
                 and not any(w in m.get('question', '').lower() for w in blacklist)
             ]
 
-            print(f"📡 Total Gamma: {len(all_markets)} | Post-filtro: {len(mercados)}")
+            print(f"📡 Total: {len(all_markets)} | Filtrados: {len(mercados)}")
 
-            # ── Paso 3: Procesar en batches ──
+            # Paso 3: Procesar en batches
             alertas_ciclo = 0
             ok_count = 0
             todos_cambios = []
@@ -282,7 +294,6 @@ def bucle_principal():
                         spread = round(((datos['best_ask'] - datos['best_bid']) / mid) * 100, 2) if mid > 0 else 0
                         tox = round((abs(cambio) / liquidez) * 100, 2) if liquidez > 0 else 0
 
-                        # Diagnóstico
                         if MODO_DIAGNOSTICO:
                             entry = {
                                 'nombre': nombre[:60],
@@ -353,21 +364,22 @@ def bucle_principal():
                 # Pausa entre batches
                 time.sleep(PAUSA_ENTRE_BATCH)
 
-            # ── Guardar memoria ──
+            # Guardar memoria
             guardar_memoria(memoria)
 
-            # ── Stats ──
+            # Stats
             stats['ciclos'] += 1
             stats['mercados'] = len(memoria)
             duracion = round(time.time() - inicio, 1)
             stats['ultimo'] = datetime.now().strftime('%H:%M:%S')
+            stats['estado'] = f'✅ Activo (último ciclo: {duracion}s)'
 
             print(
                 f"✅ Ciclo #{stats['ciclos']} ({duracion}s) | "
-                f"Libros OK: {ok_count}/{len(mercados)} | Alertas: {alertas_ciclo}"
+                f"OK: {ok_count}/{len(mercados)} | Alertas: {alertas_ciclo}"
             )
 
-            # ── Diagnóstico ──
+            # Diagnóstico
             if MODO_DIAGNOSTICO and todos_cambios and stats['ciclos'] >= 2:
                 todos_cambios.sort(key=lambda x: x['abs_cambio'], reverse=True)
                 top = todos_cambios[:TOP_N_DIAGNOSTICO]
@@ -420,6 +432,14 @@ def bucle_principal():
             time.sleep(60)
 
 
+# =========================================================
+# 🚀 ARRANQUE
+# =========================================================
+# Iniciar el bot en un thread separado ANTES de que gunicorn/flask arranque
+bot_thread = threading.Thread(target=bucle_principal, daemon=True)
+bot_thread.start()
+
+# Para gunicorn: gunicorn main:app
+# Para desarrollo local: python main.py
 if __name__ == "__main__":
-    threading.Thread(target=bucle_principal, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
