@@ -16,14 +16,14 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # 🎚️ FILTROS — CAMBIA ESTOS VALORES A TU GUSTO
 # =========================================================
-UMBRAL_BALLENA = 9000       # Cambio de delta ≥ esto → alerta directa
-UMBRAL_INSIDER = 900        # Cambio de delta ≥ esto → alerta si pasa spread/tox
+UMBRAL_BALLENA = 10000       # Cambio de delta ≥ esto → alerta directa
+UMBRAL_INSIDER = 1000        # Cambio de delta ≥ esto → alerta si pasa spread/tox
 MIN_LIQUIDITY = 900         # Liquidez mínima del mercado
 MIN_PRICE = 0.04            # Precio mínimo YES (Zona de Oro)
 MAX_PRICE = 0.96            # Precio máximo YES (Zona de Oro)
-MIN_SPREAD_PCT = 3.0        # Spread mínimo para Vía Insider
+MIN_SPREAD_PCT = 5.0        # Spread mínimo para Vía Insider
 MAX_SPREAD_PCT = 30.0       # Spread máximo (mercado roto si supera)
-MIN_TOXICITY_PCT = 5.0      # Toxicidad mínima para Vía Insider
+MIN_TOXICITY_PCT = 7.0      # Toxicidad mínima para Vía Insider
 DEPTH_RANGE = 0.10          # Profundidad del libro (10 centavos)
 INTERVALO_SEG = 300         # Segundos entre escaneos
 
