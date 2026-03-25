@@ -136,6 +136,49 @@ def leer_libro(token_id):
         return None, None
 
 
+def calcular_spread_real(bids, asks, precio_mkt):
+    """
+    Calcula el spread usando las órdenes MÁS CERCANAS al precio de mercado.
+    Ignora órdenes basura que están a kilómetros del precio real.
+    
+    Busca el bid más alto que esté dentro de 20 centavos del precio,
+    y el ask más bajo que esté dentro de 20 centavos del precio.
+    Si no hay órdenes cercanas, retorna None (mercado no operable).
+    """
+    RANGO_CERCANO = 0.20  # 20 centavos de tolerancia
+    
+    # Buscar el mejor bid cercano al precio
+    best_bid = None
+    for b in bids:
+        precio_bid = float(b['price'])
+        if abs(precio_bid - precio_mkt) <= RANGO_CERCANO:
+            if best_bid is None or precio_bid > best_bid:
+                best_bid = precio_bid
+    
+    # Buscar el mejor ask cercano al precio
+    best_ask = None
+    for a in asks:
+        precio_ask = float(a['price'])
+        if abs(precio_ask - precio_mkt) <= RANGO_CERCANO:
+            if best_ask is None or precio_ask < best_ask:
+                best_ask = precio_ask
+    
+    # Si no hay órdenes cercanas en algún lado, mercado no operable
+    if best_bid is None or best_ask is None:
+        return None, None, None
+    
+    # Si bid >= ask, libro incoherente
+    if best_bid >= best_ask:
+        return None, None, None
+    
+    mid = (best_ask + best_bid) / 2.0
+    if mid <= 0:
+        return None, None, None
+    
+    spread = round(((best_ask - best_bid) / mid) * 100, 2)
+    return spread, best_bid, best_ask
+
+
 def analizar_mercado(m):
     try:
         tokens = json.loads(m.get('clobTokenIds', '[]'))
@@ -161,24 +204,14 @@ def analizar_mercado(m):
             stats['errores'] += 1
             return None
 
-        # ══════════════════════════════════════════════
-        # FIX CRÍTICO: Validar que el libro tenga órdenes reales
-        # Si no hay bids O no hay asks en YES, no podemos calcular
-        # spread real y el mercado no es operable.
-        # ══════════════════════════════════════════════
-        if not bids_yes or not asks_yes:
+        # ══════════════════════════════════════════
+        # SPREAD: calculado con órdenes CERCANAS al precio real
+        # ══════════════════════════════════════════
+        spread, best_bid, best_ask = calcular_spread_real(bids_yes, asks_yes, precio_yes)
+        
+        # Si no hay órdenes cercanas, mercado no operable
+        if spread is None:
             return None
-
-        best_bid = float(bids_yes[0]['price'])
-        best_ask = float(asks_yes[0]['price'])
-
-        # Validar que bid < ask (libro coherente)
-        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
-            return None
-
-        # Calcular spread REAL con órdenes verificadas
-        mid = (best_ask + best_bid) / 2.0
-        spread = round(((best_ask - best_bid) / mid) * 100, 2)
 
         # Delta YES
         piso_y = max(0, precio_yes - DEPTH_RANGE)
@@ -257,7 +290,7 @@ def bucle_principal():
         f"🏃 Spread: {MIN_SPREAD_PCT}%-{MAX_SPREAD_PCT}% | 🌊 Tox: ≥{MIN_TOXICITY_PCT}%\n"
         f"⚡ Workers: {MAX_WORKERS} | Batch: {BATCH_SIZE}\n"
         f"🧠 Memoria: {len(memoria)}\n"
-        f"🔧 FIX: Spread ahora se calcula con órdenes reales"
+        f"🔧 v2: Spread calculado con órdenes cercanas al precio"
     )
 
     while True:
@@ -292,7 +325,7 @@ def bucle_principal():
 
                     ok_count += 1
                     d_actual = datos['delta']
-                    spread = datos['spread']  # Spread ya calculado y validado
+                    spread = datos['spread']
 
                     if nombre in memoria:
                         d_pasado = memoria[nombre]['delta']
