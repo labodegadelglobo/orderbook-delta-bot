@@ -5,7 +5,7 @@ import os
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask
+from flask import Flask, jsonify
 
 # =========================================================
 # 🔑 CREDENCIALES (configurar en Render → Environment)
@@ -14,18 +14,18 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # =========================================================
-# 🎚️ FILTROS
+# 🎚️ FILTROS — CAMBIA ESTOS VALORES A TU GUSTO
 # =========================================================
-UMBRAL_BALLENA = 5000
-UMBRAL_INSIDER = 500
-MIN_LIQUIDITY = 500
-MIN_PRICE = 0.04
-MAX_PRICE = 0.96
-MIN_SPREAD_PCT = 3.0
-MAX_SPREAD_PCT = 30.0
-MIN_TOXICITY_PCT = 5.0
-DEPTH_RANGE = 0.10
-INTERVALO_SEG = 300
+UMBRAL_BALLENA = 9000       # Cambio de delta ≥ esto → alerta directa
+UMBRAL_INSIDER = 900        # Cambio de delta ≥ esto → alerta si pasa spread/tox
+MIN_LIQUIDITY = 900         # Liquidez mínima del mercado
+MIN_PRICE = 0.04            # Precio mínimo YES (Zona de Oro)
+MAX_PRICE = 0.96            # Precio máximo YES (Zona de Oro)
+MIN_SPREAD_PCT = 3.0        # Spread mínimo para Vía Insider
+MAX_SPREAD_PCT = 30.0       # Spread máximo (mercado roto si supera)
+MIN_TOXICITY_PCT = 5.0      # Toxicidad mínima para Vía Insider
+DEPTH_RANGE = 0.10          # Profundidad del libro (10 centavos)
+INTERVALO_SEG = 300         # Segundos entre escaneos
 
 # ⚡ RENDIMIENTO
 MAX_WORKERS = 2
@@ -33,10 +33,9 @@ BATCH_SIZE = 10
 PAUSA_ENTRE_BATCH = 1.5
 MAX_MERCADOS_OFFSET = 10000
 
-# 🔬 DIAGNÓSTICO
-MODO_DIAGNOSTICO = True
-TOP_N_DIAGNOSTICO = 5
-
+# =========================================================
+# 🚫 BLACKLIST
+# =========================================================
 blacklist = [
     'rounds', 'fight', 'ko', 'tko', 'vs', 'stoppage', 'points', 'rebounds',
     'assists', 'pts', 'reb', 'ast', 'spread', 'game', 'xrp', 'btc',
@@ -69,28 +68,101 @@ def cargar_memoria():
     return {}
 
 # =========================================================
+# 📊 STATS PERSISTENTES (compartidos entre gunicorn threads)
+# =========================================================
+STATS_FILE = "/tmp/bot_stats.json"
+
+def guardar_stats(s):
+    try:
+        with open(STATS_FILE, 'w') as f:
+            json.dump(s, f)
+    except:
+        pass
+
+def leer_stats():
+    try:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    return None
+
+# Stats en memoria del thread del bot
+stats = {
+    'estado': '⏳ Arrancando...',
+    'ciclos': 0,
+    'alertas_total': 0,
+    'alertas_ultimo_ciclo': 0,
+    'mercados_vigilados': 0,
+    'mercados_total_gamma': 0,
+    'mercados_post_filtro': 0,
+    'libros_ok': 0,
+    'errores_clob': 0,
+    'ultimo_ciclo': 'N/A',
+    'duracion_ciclo': 0,
+    'ultimo_error': 'Ninguno',
+    'arranque': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'),
+    'errores_log': []  # Últimos 10 errores con timestamp
+}
+
+# =========================================================
 # 🔧 FLASK
 # =========================================================
 app = Flask(__name__)
 
-stats = {
-    'ciclos': 0, 'alertas': 0, 'errores': 0,
-    'ultimo': 'Iniciando...', 'mercados': 0,
-    'estado': '⏳ Arrancando...'
-}
-
 @app.route('/')
 def home():
+    s = leer_stats()
+    if s is None:
+        return "⏳ Bot arrancando, espera unos minutos...", 200
+
+    # Página de status bonita y clara
+    errores_txt = ""
+    if s.get('errores_log'):
+        errores_txt = "\n\n🔴 ÚLTIMOS ERRORES:\n"
+        for err in s['errores_log'][-5:]:
+            errores_txt += f"  [{err['time']}] {err['msg']}\n"
+
     return (
-        f"🛰️ Radar 5.5 | {stats['estado']}\n"
-        f"Mercados: {stats['mercados']} | Ciclos: {stats['ciclos']} | "
-        f"Alertas: {stats['alertas']} | Errores: {stats['errores']} | "
-        f"Último: {stats['ultimo']}"
-    ), 200
+        f"🛰️ RADAR 5.5 — STATUS\n"
+        f"{'='*40}\n\n"
+        f"🟢 Estado: {s['estado']}\n"
+        f"🕐 Arrancó: {s['arranque']}\n"
+        f"🕐 Último ciclo: {s['ultimo_ciclo']}\n\n"
+        f"📊 CICLOS\n"
+        f"  Total: {s['ciclos']}\n"
+        f"  Duración último: {s['duracion_ciclo']}s\n\n"
+        f"📡 MERCADOS\n"
+        f"  Gamma API: {s['mercados_total_gamma']}\n"
+        f"  Post-filtro: {s['mercados_post_filtro']}\n"
+        f"  Libros OK: {s['libros_ok']}\n"
+        f"  En memoria: {s['mercados_vigilados']}\n\n"
+        f"🚨 ALERTAS\n"
+        f"  Total enviadas: {s['alertas_total']}\n"
+        f"  Último ciclo: {s['alertas_ultimo_ciclo']}\n\n"
+        f"❌ ERRORES\n"
+        f"  CLOB (rate limit/timeout): {s['errores_clob']}\n"
+        f"  Último error: {s['ultimo_error']}\n"
+        f"{errores_txt}\n"
+        f"🎚️ FILTROS ACTIVOS\n"
+        f"  🐋 Ballena: ≥${UMBRAL_BALLENA:,}\n"
+        f"  🥷 Insider: ≥${UMBRAL_INSIDER:,} + Spr≥{MIN_SPREAD_PCT}% ó Tox≥{MIN_TOXICITY_PCT}%\n"
+        f"  💧 Liquidez mín: ${MIN_LIQUIDITY:,}\n"
+        f"  🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
+        f"  🏃 Spread máx: {MAX_SPREAD_PCT}%\n"
+    ), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 @app.route('/health')
 def health():
     return "OK", 200
+
+@app.route('/stats')
+def stats_json():
+    s = leer_stats()
+    if s:
+        return jsonify(s)
+    return jsonify({'estado': 'arrancando'}), 200
 
 # =========================================================
 # 🔧 HTTP
@@ -108,17 +180,30 @@ main_session = requests.Session()
 main_session.headers.update({'Accept': 'application/json'})
 
 
+def log_error(msg):
+    """Registra un error en el log interno (últimos 10)."""
+    stats['errores_log'].append({
+        'time': datetime.utcnow().strftime('%H:%M:%S'),
+        'msg': str(msg)[:100]
+    })
+    if len(stats['errores_log']) > 10:
+        stats['errores_log'] = stats['errores_log'][-10:]
+    stats['ultimo_error'] = str(msg)[:100]
+
+
 def enviar_telegram(mensaje):
     ids = [idx.strip() for idx in CHAT_IDS_RAW.split(',') if idx.strip()]
     for cid in ids:
         try:
-            main_session.post(
+            resp = main_session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 data={"chat_id": cid, "text": mensaje, "parse_mode": "Markdown", "disable_web_page_preview": True},
                 timeout=10
             )
-        except:
-            pass
+            if resp.status_code != 200:
+                log_error(f"Telegram {resp.status_code}: {resp.text[:50]}")
+        except Exception as e:
+            log_error(f"Telegram: {e}")
 
 
 def leer_libro(token_id):
@@ -137,44 +222,31 @@ def leer_libro(token_id):
 
 
 def calcular_spread_real(bids, asks, precio_mkt):
-    """
-    Calcula el spread usando las órdenes MÁS CERCANAS al precio de mercado.
-    Ignora órdenes basura que están a kilómetros del precio real.
-    
-    Busca el bid más alto que esté dentro de 20 centavos del precio,
-    y el ask más bajo que esté dentro de 20 centavos del precio.
-    Si no hay órdenes cercanas, retorna None (mercado no operable).
-    """
-    RANGO_CERCANO = 0.20  # 20 centavos de tolerancia
-    
-    # Buscar el mejor bid cercano al precio
+    RANGO_CERCANO = 0.20
+
     best_bid = None
     for b in bids:
-        precio_bid = float(b['price'])
-        if abs(precio_bid - precio_mkt) <= RANGO_CERCANO:
-            if best_bid is None or precio_bid > best_bid:
-                best_bid = precio_bid
-    
-    # Buscar el mejor ask cercano al precio
+        p = float(b['price'])
+        if abs(p - precio_mkt) <= RANGO_CERCANO:
+            if best_bid is None or p > best_bid:
+                best_bid = p
+
     best_ask = None
     for a in asks:
-        precio_ask = float(a['price'])
-        if abs(precio_ask - precio_mkt) <= RANGO_CERCANO:
-            if best_ask is None or precio_ask < best_ask:
-                best_ask = precio_ask
-    
-    # Si no hay órdenes cercanas en algún lado, mercado no operable
+        p = float(a['price'])
+        if abs(p - precio_mkt) <= RANGO_CERCANO:
+            if best_ask is None or p < best_ask:
+                best_ask = p
+
     if best_bid is None or best_ask is None:
         return None, None, None
-    
-    # Si bid >= ask, libro incoherente
     if best_bid >= best_ask:
         return None, None, None
-    
+
     mid = (best_ask + best_bid) / 2.0
     if mid <= 0:
         return None, None, None
-    
+
     spread = round(((best_ask - best_bid) / mid) * 100, 2)
     return spread, best_bid, best_ask
 
@@ -194,32 +266,25 @@ def analizar_mercado(m):
 
         bids_yes, asks_yes = leer_libro(tokens[0])
         if bids_yes is None:
-            stats['errores'] += 1
+            stats['errores_clob'] += 1
             return None
 
         time.sleep(0.1)
 
         bids_no, asks_no = leer_libro(tokens[1])
         if bids_no is None:
-            stats['errores'] += 1
+            stats['errores_clob'] += 1
             return None
 
-        # ══════════════════════════════════════════
-        # SPREAD: calculado con órdenes CERCANAS al precio real
-        # ══════════════════════════════════════════
         spread, best_bid, best_ask = calcular_spread_real(bids_yes, asks_yes, precio_yes)
-        
-        # Si no hay órdenes cercanas, mercado no operable
         if spread is None:
             return None
 
-        # Delta YES
         piso_y = max(0, precio_yes - DEPTH_RANGE)
         techo_y = min(1, precio_yes + DEPTH_RANGE)
         bid_usd_yes = sum(float(b['price']) * float(b['size']) for b in bids_yes if float(b['price']) >= piso_y)
         ask_usd_yes = sum(float(a['price']) * float(a['size']) for a in asks_yes if float(a['price']) <= techo_y)
 
-        # Delta NO
         piso_n = max(0, precio_no - DEPTH_RANGE)
         techo_n = min(1, precio_no + DEPTH_RANGE)
         bid_usd_no = sum(float(b['price']) * float(b['size']) for b in bids_no if float(b['price']) >= piso_n)
@@ -238,8 +303,8 @@ def analizar_mercado(m):
             'delta_yes': int(delta_yes),
             'delta_no': int(delta_no)
         }
-    except:
-        stats['errores'] += 1
+    except Exception as e:
+        stats['errores_clob'] += 1
         return None
 
 
@@ -268,7 +333,8 @@ def obtener_todos_mercados():
                 f"&order=liquidity&ascending=false",
                 timeout=15
             ).json()
-        except:
+        except Exception as e:
+            log_error(f"Gamma API offset {offset}: {e}")
             break
         if not data:
             break
@@ -282,35 +348,36 @@ def bucle_principal():
     print("🤖 Radar 5.5: Bot iniciado", flush=True)
     memoria = cargar_memoria()
     stats['estado'] = '✅ Activo'
+    guardar_stats(stats)
 
     enviar_telegram(
-        f"⚡ *Radar 5.5 Online* — {'🔬 DIAG' if MODO_DIAGNOSTICO else '🎯 PROD'}\n\n"
+        f"⚡ *Radar 5.5 Online*\n\n"
         f"🐋 Ballena: ≥${UMBRAL_BALLENA:,} | 🥷 Insider: ≥${UMBRAL_INSIDER:,}\n"
         f"💧 Liq: ${MIN_LIQUIDITY:,} | 🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
         f"🏃 Spread: {MIN_SPREAD_PCT}%-{MAX_SPREAD_PCT}% | 🌊 Tox: ≥{MIN_TOXICITY_PCT}%\n"
-        f"⚡ Workers: {MAX_WORKERS} | Batch: {BATCH_SIZE}\n"
-        f"🧠 Memoria: {len(memoria)}\n"
-        f"🔧 v2: Spread calculado con órdenes cercanas al precio"
+        f"🧠 Memoria: {len(memoria)}"
     )
 
     while True:
         try:
             inicio = time.time()
             stats['estado'] = '🔄 Escaneando...'
+            guardar_stats(stats)
 
             all_markets = obtener_todos_mercados()
+            stats['mercados_total_gamma'] = len(all_markets)
 
             mercados = [
                 m for m in all_markets
                 if float(m.get('liquidity', 0)) >= MIN_LIQUIDITY
                 and not any(w in m.get('question', '').lower() for w in blacklist)
             ]
+            stats['mercados_post_filtro'] = len(mercados)
 
             print(f"📡 Total: {len(all_markets)} | Filtrados: {len(mercados)}", flush=True)
 
             alertas_ciclo = 0
             ok_count = 0
-            todos_cambios = []
 
             for batch_start in range(0, len(mercados), BATCH_SIZE):
                 batch = mercados[batch_start:batch_start + BATCH_SIZE]
@@ -336,28 +403,6 @@ def bucle_principal():
                             continue
 
                         tox = round((abs(cambio) / liquidez) * 100, 2) if liquidez > 0 else 0
-
-                        if MODO_DIAGNOSTICO:
-                            entry = {
-                                'nombre': nombre[:60],
-                                'cambio': cambio,
-                                'abs_cambio': abs(cambio),
-                                'spread': spread,
-                                'tox': tox,
-                                'liquidez': liquidez,
-                                'precio': datos['precio'],
-                                'bloqueado_por': []
-                            }
-                            if spread > MAX_SPREAD_PCT:
-                                entry['bloqueado_por'].append(f"Spread {spread}%>{MAX_SPREAD_PCT}%")
-                            elif abs(cambio) >= UMBRAL_BALLENA:
-                                pass
-                            elif abs(cambio) >= UMBRAL_INSIDER:
-                                if spread < MIN_SPREAD_PCT and tox < MIN_TOXICITY_PCT:
-                                    entry['bloqueado_por'].append(f"Spr {spread}%<{MIN_SPREAD_PCT}% Y Tox {tox}%<{MIN_TOXICITY_PCT}%")
-                            else:
-                                entry['bloqueado_por'].append(f"Delta ${abs(cambio)}<${UMBRAL_INSIDER}")
-                            todos_cambios.append(entry)
 
                         # ═══ ALERTAS ═══
                         if spread > MAX_SPREAD_PCT:
@@ -400,7 +445,7 @@ def bucle_principal():
                             )
                             enviar_telegram(mensaje)
                             alertas_ciclo += 1
-                            stats['alertas'] += 1
+                            stats['alertas_total'] += 1
 
                     memoria[nombre] = {'delta': d_actual}
 
@@ -408,64 +453,29 @@ def bucle_principal():
 
             guardar_memoria(memoria)
 
+            # Actualizar stats
             stats['ciclos'] += 1
-            stats['mercados'] = len(memoria)
+            stats['alertas_ultimo_ciclo'] = alertas_ciclo
+            stats['mercados_vigilados'] = len(memoria)
+            stats['libros_ok'] = ok_count
             duracion = round(time.time() - inicio, 1)
-            stats['ultimo'] = datetime.now().strftime('%H:%M:%S')
-            stats['estado'] = f'✅ Activo ({duracion}s)'
+            stats['duracion_ciclo'] = duracion
+            stats['ultimo_ciclo'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+            stats['estado'] = f'✅ Activo'
+            guardar_stats(stats)
 
             print(f"✅ Ciclo #{stats['ciclos']} ({duracion}s) | OK: {ok_count}/{len(mercados)} | Alertas: {alertas_ciclo}", flush=True)
-
-            if MODO_DIAGNOSTICO and todos_cambios and stats['ciclos'] >= 2:
-                todos_cambios.sort(key=lambda x: x['abs_cambio'], reverse=True)
-                top = todos_cambios[:TOP_N_DIAGNOSTICO]
-
-                lineas = [f"🔬 *DIAG #{stats['ciclos']}* ({duracion}s)\n"]
-                lineas.append(f"📡 OK: {ok_count}/{len(mercados)} | Mov: {len(todos_cambios)}\n")
-
-                for j, t in enumerate(top, 1):
-                    d = "🟢" if t['cambio'] > 0 else "🔴"
-                    bloq = " | ".join(t['bloqueado_por']) if t['bloqueado_por'] else "✅ PASÓ"
-                    lineas.append(
-                        f"\n*{j}. {t['nombre']}*\n"
-                        f"   {d} `${t['cambio']:,}` | Liq: `${t['liquidez']:,}`\n"
-                        f"   Spr: `{t['spread']}%` | Tox: `{t['tox']}%`\n"
-                        f"   → _{bloq}_"
-                    )
-
-                total_bloq = sum(1 for t in todos_cambios if t['bloqueado_por'])
-                total_delta = sum(1 for t in todos_cambios if any('Delta' in b for b in t['bloqueado_por']))
-                total_spr = sum(1 for t in todos_cambios if any('>' in b for b in t['bloqueado_por']))
-                total_micro = sum(1 for t in todos_cambios if any('Y Tox' in b for b in t['bloqueado_por']))
-
-                lineas.append(
-                    f"\n\n📈 *Filtros:*\n"
-                    f"Total: {len(todos_cambios)} | Bloq: {total_bloq}\n"
-                    f"├ Delta bajo: {total_delta}\n"
-                    f"├ Spread roto: {total_spr}\n"
-                    f"└ Sin urgencia: {total_micro}\n"
-                    f"✅ Pasaron: {len(todos_cambios) - total_bloq}"
-                )
-
-                enviar_telegram("\n".join(lineas))
-
-            if stats['ciclos'] % 12 == 0:
-                enviar_telegram(
-                    f"📊 *Reporte #{stats['ciclos']}*\n"
-                    f"👁️ Mercados: {len(memoria)}\n"
-                    f"📡 OK: {ok_count}/{len(mercados)}\n"
-                    f"🚨 Alertas: {stats['alertas']}\n"
-                    f"❌ Errores: {stats['errores']}\n"
-                    f"⏱️ Ciclo: {duracion}s"
-                )
 
             time.sleep(INTERVALO_SEG)
 
         except Exception as e:
-            print(f"❌ Error: {e}", flush=True)
+            error_msg = f"{type(e).__name__}: {str(e)[:80]}"
+            print(f"❌ Error: {error_msg}", flush=True)
             import traceback
             traceback.print_exc()
-            stats['estado'] = f'❌ Error: {str(e)[:50]}'
+            log_error(error_msg)
+            stats['estado'] = f'⚠️ Error (reintentando...)'
+            guardar_stats(stats)
             time.sleep(60)
 
 
