@@ -16,14 +16,24 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 # 🎚️ FILTROS — CAMBIA ESTOS VALORES A TU GUSTO
 # =========================================================
-UMBRAL_BALLENA = 20000       # Cambio de delta ≥ esto → alerta directa
-UMBRAL_INSIDER = 5000        # Cambio de delta ≥ esto → alerta si pasa spread/tox
-MIN_LIQUIDITY = 900         # Liquidez mínima del mercado
+
+# --- FILTROS GLOBALES (aplican a Ballenas e Insiders) ---
+MIN_LIQUIDITY = 500         # Liquidez mínima del mercado ($)
 MIN_PRICE = 0.04            # Precio mínimo YES (Zona de Oro)
 MAX_PRICE = 0.96            # Precio máximo YES (Zona de Oro)
-MIN_SPREAD_PCT = 5.0        # Spread mínimo para Vía Insider
-MAX_SPREAD_PCT = 30.0       # Spread máximo (mercado roto si supera)
-MIN_TOXICITY_PCT = 7.0      # Toxicidad mínima para Vía Insider
+MAX_SPREAD_PCT = 30.0       # Spread máximo — mercado roto si supera (%)
+
+# --- VÍA 1: 🐋 BALLENA ---
+# Solo necesita: delta absoluto ≥ umbral + filtros globales
+UMBRAL_BALLENA = 100000       # Cambio de delta ≥ esto → alerta directa ($)
+
+# --- VÍA 2: 🥷 INSIDER (TODOS obligatorios) ---
+UMBRAL_INSIDER = 500        # Cambio de delta absoluto mínimo ($)
+MIN_DELTA_PCT = 100.0       # Cambio de delta porcentual mínimo (%)
+MIN_SPREAD_PCT = 3.0        # Spread mínimo (%)
+MIN_TOXICITY_PCT = 5.0      # Toxicidad mínima (%)
+
+# --- PROFUNDIDAD Y TIMING ---
 DEPTH_RANGE = 0.10          # Profundidad del libro (10 centavos)
 INTERVALO_SEG = 300         # Segundos entre escaneos
 
@@ -68,7 +78,7 @@ def cargar_memoria():
     return {}
 
 # =========================================================
-# 📊 STATS PERSISTENTES (compartidos entre gunicorn threads)
+# 📊 STATS PERSISTENTES
 # =========================================================
 STATS_FILE = "/tmp/bot_stats.json"
 
@@ -88,11 +98,12 @@ def leer_stats():
         pass
     return None
 
-# Stats en memoria del thread del bot
 stats = {
     'estado': '⏳ Arrancando...',
     'ciclos': 0,
     'alertas_total': 0,
+    'alertas_ballena': 0,
+    'alertas_insider': 0,
     'alertas_ultimo_ciclo': 0,
     'mercados_vigilados': 0,
     'mercados_total_gamma': 0,
@@ -103,7 +114,7 @@ stats = {
     'duracion_ciclo': 0,
     'ultimo_error': 'Ninguno',
     'arranque': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'),
-    'errores_log': []  # Últimos 10 errores con timestamp
+    'errores_log': []
 }
 
 # =========================================================
@@ -117,10 +128,9 @@ def home():
     if s is None:
         return "⏳ Bot arrancando, espera unos minutos...", 200
 
-    # Página de status bonita y clara
     errores_txt = ""
     if s.get('errores_log'):
-        errores_txt = "\n\n🔴 ÚLTIMOS ERRORES:\n"
+        errores_txt = "\n🔴 ÚLTIMOS ERRORES:\n"
         for err in s['errores_log'][-5:]:
             errores_txt += f"  [{err['time']}] {err['msg']}\n"
 
@@ -139,18 +149,16 @@ def home():
         f"  Libros OK: {s['libros_ok']}\n"
         f"  En memoria: {s['mercados_vigilados']}\n\n"
         f"🚨 ALERTAS\n"
-        f"  Total enviadas: {s['alertas_total']}\n"
+        f"  Total: {s['alertas_total']} (🐋 {s.get('alertas_ballena',0)} | 🥷 {s.get('alertas_insider',0)})\n"
         f"  Último ciclo: {s['alertas_ultimo_ciclo']}\n\n"
         f"❌ ERRORES\n"
-        f"  CLOB (rate limit/timeout): {s['errores_clob']}\n"
-        f"  Último error: {s['ultimo_error']}\n"
+        f"  CLOB: {s['errores_clob']}\n"
+        f"  Último: {s['ultimo_error']}\n"
         f"{errores_txt}\n"
-        f"🎚️ FILTROS ACTIVOS\n"
-        f"  🐋 Ballena: ≥${UMBRAL_BALLENA:,}\n"
-        f"  🥷 Insider: ≥${UMBRAL_INSIDER:,} + Spr≥{MIN_SPREAD_PCT}% ó Tox≥{MIN_TOXICITY_PCT}%\n"
-        f"  💧 Liquidez mín: ${MIN_LIQUIDITY:,}\n"
-        f"  🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
-        f"  🏃 Spread máx: {MAX_SPREAD_PCT}%\n"
+        f"🎚️ FILTROS\n"
+        f"  Globales: Liq≥${MIN_LIQUIDITY:,} | Precio ${MIN_PRICE}-${MAX_PRICE} | Spread máx {MAX_SPREAD_PCT}%\n"
+        f"  🐋 Ballena: Delta≥${UMBRAL_BALLENA:,}\n"
+        f"  🥷 Insider: Delta≥${UMBRAL_INSIDER:,} AND Δ%≥{MIN_DELTA_PCT}% AND Spr≥{MIN_SPREAD_PCT}% AND Tox≥{MIN_TOXICITY_PCT}%\n"
     ), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 @app.route('/health')
@@ -181,7 +189,6 @@ main_session.headers.update({'Accept': 'application/json'})
 
 
 def log_error(msg):
-    """Registra un error en el log interno (últimos 10)."""
     stats['errores_log'].append({
         'time': datetime.utcnow().strftime('%H:%M:%S'),
         'msg': str(msg)[:100]
@@ -201,7 +208,7 @@ def enviar_telegram(mensaje):
                 timeout=10
             )
             if resp.status_code != 200:
-                log_error(f"Telegram {resp.status_code}: {resp.text[:50]}")
+                log_error(f"Telegram {resp.status_code}")
         except Exception as e:
             log_error(f"Telegram: {e}")
 
@@ -303,7 +310,7 @@ def analizar_mercado(m):
             'delta_yes': int(delta_yes),
             'delta_no': int(delta_no)
         }
-    except Exception as e:
+    except:
         stats['errores_clob'] += 1
         return None
 
@@ -334,7 +341,7 @@ def obtener_todos_mercados():
                 timeout=15
             ).json()
         except Exception as e:
-            log_error(f"Gamma API offset {offset}: {e}")
+            log_error(f"Gamma offset {offset}: {e}")
             break
         if not data:
             break
@@ -352,9 +359,14 @@ def bucle_principal():
 
     enviar_telegram(
         f"⚡ *Radar 5.5 Online*\n\n"
-        f"🐋 Ballena: ≥${UMBRAL_BALLENA:,} | 🥷 Insider: ≥${UMBRAL_INSIDER:,}\n"
-        f"💧 Liq: ${MIN_LIQUIDITY:,} | 🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE}\n"
-        f"🏃 Spread: {MIN_SPREAD_PCT}%-{MAX_SPREAD_PCT}% | 🌊 Tox: ≥{MIN_TOXICITY_PCT}%\n"
+        f"*Filtros Globales:*\n"
+        f"💧 Liq: ≥${MIN_LIQUIDITY:,} | 🏷️ Precio: ${MIN_PRICE}-${MAX_PRICE} | Spr máx: {MAX_SPREAD_PCT}%\n\n"
+        f"🐋 *Ballena:* Delta ≥ ${UMBRAL_BALLENA:,}\n\n"
+        f"🥷 *Insider (TODOS obligatorios):*\n"
+        f"  Delta ≥ ${UMBRAL_INSIDER:,}\n"
+        f"  Δ% ≥ {MIN_DELTA_PCT}%\n"
+        f"  Spread ≥ {MIN_SPREAD_PCT}%\n"
+        f"  Toxicidad ≥ {MIN_TOXICITY_PCT}%\n\n"
         f"🧠 Memoria: {len(memoria)}"
     )
 
@@ -404,15 +416,38 @@ def bucle_principal():
 
                         tox = round((abs(cambio) / liquidez) * 100, 2) if liquidez > 0 else 0
 
-                        # ═══ ALERTAS ═══
+                        # Calcular Delta% (cambio porcentual del delta)
+                        # Si delta anterior es 0, usamos el cambio absoluto como referencia
+                        if d_pasado != 0:
+                            delta_pct = round((abs(cambio) / abs(d_pasado)) * 100, 2)
+                        else:
+                            delta_pct = 999.99  # Delta era 0, cualquier cambio es infinito
+
+                        # ═══════════════════════════════════════
+                        # 🛡️ FILTRO GLOBAL: Spread máximo
+                        # ═══════════════════════════════════════
                         if spread > MAX_SPREAD_PCT:
                             memoria[nombre] = {'delta': d_actual}
                             continue
 
+                        # ═══════════════════════════════════════
+                        # 🐋 VÍA 1: BALLENA
+                        # Solo necesita: delta absoluto ≥ umbral
+                        # ═══════════════════════════════════════
                         es_ballena = abs(cambio) >= UMBRAL_BALLENA
+
+                        # ═══════════════════════════════════════
+                        # 🥷 VÍA 2: INSIDER (TODOS obligatorios)
+                        # Delta ≥ umbral AND
+                        # Delta% ≥ mínimo AND
+                        # Spread ≥ mínimo AND
+                        # Toxicidad ≥ mínimo
+                        # ═══════════════════════════════════════
                         es_insider = (
                             abs(cambio) >= UMBRAL_INSIDER
-                            and (spread >= MIN_SPREAD_PCT or tox >= MIN_TOXICITY_PCT)
+                            and delta_pct >= MIN_DELTA_PCT
+                            and spread >= MIN_SPREAD_PCT
+                            and tox >= MIN_TOXICITY_PCT
                         )
 
                         if es_ballena or es_insider:
@@ -422,17 +457,17 @@ def bucle_principal():
                             if es_ballena:
                                 razon = f"Delta ≥ ${UMBRAL_BALLENA:,}"
                             else:
-                                razones = []
-                                if spread >= MIN_SPREAD_PCT:
-                                    razones.append(f"Spr {spread}%≥{MIN_SPREAD_PCT}%")
-                                if tox >= MIN_TOXICITY_PCT:
-                                    razones.append(f"Tox {tox}%≥{MIN_TOXICITY_PCT}%")
-                                razon = " + ".join(razones)
+                                razon = (
+                                    f"Δ ${abs(cambio):,}≥${UMBRAL_INSIDER:,} + "
+                                    f"Δ% {delta_pct}%≥{MIN_DELTA_PCT}% + "
+                                    f"Spr {spread}%≥{MIN_SPREAD_PCT}% + "
+                                    f"Tox {tox}%≥{MIN_TOXICITY_PCT}%"
+                                )
 
                             mensaje = (
                                 f"🚨 *ALERTA {etiqueta}* 🚨\n\n"
                                 f"📌 *{nombre}*\n\n"
-                                f"💰 *Cambio:* `${cambio:,}`\n"
+                                f"💰 *Cambio:* `${cambio:,}` (`{delta_pct}%`)\n"
                                 f"🕰️ *Delta:* `${d_pasado:,}` → `${d_actual:,}`\n"
                                 f"   ├ YES: `${datos['delta_yes']:,}` | NO: `${datos['delta_no']:,}`\n"
                                 f"💧 *Liquidez:* `${liquidez:,}`\n"
@@ -446,6 +481,10 @@ def bucle_principal():
                             enviar_telegram(mensaje)
                             alertas_ciclo += 1
                             stats['alertas_total'] += 1
+                            if es_ballena:
+                                stats['alertas_ballena'] += 1
+                            else:
+                                stats['alertas_insider'] += 1
 
                     memoria[nombre] = {'delta': d_actual}
 
@@ -453,7 +492,6 @@ def bucle_principal():
 
             guardar_memoria(memoria)
 
-            # Actualizar stats
             stats['ciclos'] += 1
             stats['alertas_ultimo_ciclo'] = alertas_ciclo
             stats['mercados_vigilados'] = len(memoria)
@@ -461,7 +499,7 @@ def bucle_principal():
             duracion = round(time.time() - inicio, 1)
             stats['duracion_ciclo'] = duracion
             stats['ultimo_ciclo'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-            stats['estado'] = f'✅ Activo'
+            stats['estado'] = '✅ Activo'
             guardar_stats(stats)
 
             print(f"✅ Ciclo #{stats['ciclos']} ({duracion}s) | OK: {ok_count}/{len(mercados)} | Alertas: {alertas_ciclo}", flush=True)
@@ -474,7 +512,7 @@ def bucle_principal():
             import traceback
             traceback.print_exc()
             log_error(error_msg)
-            stats['estado'] = f'⚠️ Error (reintentando...)'
+            stats['estado'] = '⚠️ Error (reintentando...)'
             guardar_stats(stats)
             time.sleep(60)
 
