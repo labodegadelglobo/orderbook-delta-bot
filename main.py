@@ -18,7 +18,7 @@ CHAT_IDS_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 # =========================================================
 
 # --- FILTROS GLOBALES (aplican a Ballenas e Insiders) ---
-MIN_LIQUIDITY = 500         # Liquidez mínima del mercado ($)
+MIN_LIQUIDITY = 900         # Liquidez mínima del mercado ($)
 MIN_PRICE = 0.04            # Precio mínimo YES (Zona de Oro)
 MAX_PRICE = 0.96            # Precio máximo YES (Zona de Oro)
 MAX_SPREAD_PCT = 30.0       # Spread máximo — mercado roto si supera (%)
@@ -27,10 +27,10 @@ MAX_SPREAD_PCT = 30.0       # Spread máximo — mercado roto si supera (%)
 UMBRAL_BALLENA = 100000     # Cambio de delta ≥ esto → alerta directa ($)
 
 # --- VÍA 2: 🥷 INSIDER (TODOS obligatorios) ---
-UMBRAL_INSIDER = 1000        # Cambio de delta absoluto mínimo ($)
-MIN_DELTA_PCT = 100.0       # Cambio de delta porcentual mínimo (%)
-MIN_SPREAD_PCT = 3.0        # Spread mínimo (%)
-MIN_TOXICITY_PCT = 5.0      # Toxicidad mínima (%)
+UMBRAL_INSIDER = 5000        # Cambio de delta absoluto mínimo ($)
+MIN_DELTA_PCT = 50.0       # Cambio de delta porcentual mínimo (%)
+MIN_SPREAD_PCT = 5.0        # Spread mínimo (%)
+MIN_TOXICITY_PCT = 7.0      # Toxicidad mínima (%)
 
 # --- PROFUNDIDAD Y TIMING ---
 DEPTH_PCT = 10.0            # Profundidad del libro como % del precio (igual que Kiyotaka)
