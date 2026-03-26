@@ -24,17 +24,16 @@ MAX_PRICE = 0.96            # Precio máximo YES (Zona de Oro)
 MAX_SPREAD_PCT = 30.0       # Spread máximo — mercado roto si supera (%)
 
 # --- VÍA 1: 🐋 BALLENA ---
-# Solo necesita: delta absoluto ≥ umbral + filtros globales
-UMBRAL_BALLENA = 100000       # Cambio de delta ≥ esto → alerta directa ($)
+UMBRAL_BALLENA = 100000     # Cambio de delta ≥ esto → alerta directa ($)
 
 # --- VÍA 2: 🥷 INSIDER (TODOS obligatorios) ---
-UMBRAL_INSIDER = 500        # Cambio de delta absoluto mínimo ($)
+UMBRAL_INSIDER = 1000        # Cambio de delta absoluto mínimo ($)
 MIN_DELTA_PCT = 100.0       # Cambio de delta porcentual mínimo (%)
 MIN_SPREAD_PCT = 3.0        # Spread mínimo (%)
 MIN_TOXICITY_PCT = 5.0      # Toxicidad mínima (%)
 
 # --- PROFUNDIDAD Y TIMING ---
-DEPTH_RANGE = 0.10          # Profundidad del libro (10 centavos)
+DEPTH_PCT = 10.0            # Profundidad del libro como % del precio (igual que Kiyotaka)
 INTERVALO_SEG = 300         # Segundos entre escaneos
 
 # ⚡ RENDIMIENTO
@@ -159,6 +158,7 @@ def home():
         f"  Globales: Liq≥${MIN_LIQUIDITY:,} | Precio ${MIN_PRICE}-${MAX_PRICE} | Spread máx {MAX_SPREAD_PCT}%\n"
         f"  🐋 Ballena: Delta≥${UMBRAL_BALLENA:,}\n"
         f"  🥷 Insider: Delta≥${UMBRAL_INSIDER:,} AND Δ%≥{MIN_DELTA_PCT}% AND Spr≥{MIN_SPREAD_PCT}% AND Tox≥{MIN_TOXICITY_PCT}%\n"
+        f"  📏 Depth: {DEPTH_PCT}% del precio (Kiyotaka)\n"
     ), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 @app.route('/health')
@@ -229,6 +229,7 @@ def leer_libro(token_id):
 
 
 def calcular_spread_real(bids, asks, precio_mkt):
+    """Spread con órdenes cercanas al precio real (±20 centavos)."""
     RANGO_CERCANO = 0.20
 
     best_bid = None
@@ -258,6 +259,36 @@ def calcular_spread_real(bids, asks, precio_mkt):
     return spread, best_bid, best_ask
 
 
+def sum_bids_usd(bids, precio_mkt, depth_pct):
+    """
+    Suma price × size (USD) de bids dentro del % de profundidad.
+    Igual que Kiyotaka en modo dólares.
+    
+    Si precio = 0.50 y depth = 10%:
+    rango = 0.50 × 0.10 = 0.05
+    piso = 0.50 - 0.05 = 0.45
+    Solo suma bids con price >= 0.45
+    """
+    rango = precio_mkt * (depth_pct / 100.0)
+    piso = max(0, precio_mkt - rango)
+    return sum(float(b['price']) * float(b['size']) for b in bids if float(b['price']) >= piso)
+
+
+def sum_asks_usd(asks, precio_mkt, depth_pct):
+    """
+    Suma price × size (USD) de asks dentro del % de profundidad.
+    Igual que Kiyotaka en modo dólares.
+    
+    Si precio = 0.50 y depth = 10%:
+    rango = 0.50 × 0.10 = 0.05
+    techo = 0.50 + 0.05 = 0.55
+    Solo suma asks con price <= 0.55
+    """
+    rango = precio_mkt * (depth_pct / 100.0)
+    techo = min(1, precio_mkt + rango)
+    return sum(float(a['price']) * float(a['size']) for a in asks if float(a['price']) <= techo)
+
+
 def analizar_mercado(m):
     try:
         tokens = json.loads(m.get('clobTokenIds', '[]'))
@@ -283,22 +314,26 @@ def analizar_mercado(m):
             stats['errores_clob'] += 1
             return None
 
+        # Spread
         spread, best_bid, best_ask = calcular_spread_real(bids_yes, asks_yes, precio_yes)
         if spread is None:
             return None
 
-        piso_y = max(0, precio_yes - DEPTH_RANGE)
-        techo_y = min(1, precio_yes + DEPTH_RANGE)
-        bid_usd_yes = sum(float(b['price']) * float(b['size']) for b in bids_yes if float(b['price']) >= piso_y)
-        ask_usd_yes = sum(float(a['price']) * float(a['size']) for a in asks_yes if float(a['price']) <= techo_y)
+        # ══════════════════════════════════════════
+        # DELTA EN USD CON DEPTH % (estilo Kiyotaka)
+        # ══════════════════════════════════════════
 
-        piso_n = max(0, precio_no - DEPTH_RANGE)
-        techo_n = min(1, precio_no + DEPTH_RANGE)
-        bid_usd_no = sum(float(b['price']) * float(b['size']) for b in bids_no if float(b['price']) >= piso_n)
-        ask_usd_no = sum(float(a['price']) * float(a['size']) for a in asks_no if float(a['price']) <= techo_n)
+        # Delta YES = sumBids_YES - sumAsks_YES (en USD)
+        sb_yes = sum_bids_usd(bids_yes, precio_yes, DEPTH_PCT)
+        sa_yes = sum_asks_usd(asks_yes, precio_yes, DEPTH_PCT)
+        delta_yes = sb_yes - sa_yes
 
-        delta_yes = bid_usd_yes - ask_usd_yes
-        delta_no = bid_usd_no - ask_usd_no
+        # Delta NO = sumBids_NO - sumAsks_NO (en USD)
+        sb_no = sum_bids_usd(bids_no, precio_no, DEPTH_PCT)
+        sa_no = sum_asks_usd(asks_no, precio_no, DEPTH_PCT)
+        delta_no = sb_no - sa_no
+
+        # Delta combinado
         delta_total = int(delta_yes - delta_no)
 
         return {
@@ -308,7 +343,11 @@ def analizar_mercado(m):
             'spread': spread,
             'precio': precio_yes,
             'delta_yes': int(delta_yes),
-            'delta_no': int(delta_no)
+            'delta_no': int(delta_no),
+            'bids_yes': int(sb_yes),
+            'asks_yes': int(sa_yes),
+            'bids_no': int(sb_no),
+            'asks_no': int(sa_no)
         }
     except:
         stats['errores_clob'] += 1
@@ -367,6 +406,7 @@ def bucle_principal():
         f"  Δ% ≥ {MIN_DELTA_PCT}%\n"
         f"  Spread ≥ {MIN_SPREAD_PCT}%\n"
         f"  Toxicidad ≥ {MIN_TOXICITY_PCT}%\n\n"
+        f"📏 Depth: {DEPTH_PCT}% del precio (Kiyotaka)\n"
         f"🧠 Memoria: {len(memoria)}"
     )
 
@@ -416,33 +456,21 @@ def bucle_principal():
 
                         tox = round((abs(cambio) / liquidez) * 100, 2) if liquidez > 0 else 0
 
-                        # Calcular Delta% (cambio porcentual del delta)
-                        # Si delta anterior es 0, usamos el cambio absoluto como referencia
+                        # Delta%
                         if d_pasado != 0:
                             delta_pct = round((abs(cambio) / abs(d_pasado)) * 100, 2)
                         else:
-                            delta_pct = 999.99  # Delta era 0, cualquier cambio es infinito
+                            delta_pct = 999.99
 
-                        # ═══════════════════════════════════════
-                        # 🛡️ FILTRO GLOBAL: Spread máximo
-                        # ═══════════════════════════════════════
+                        # ═══ FILTRO GLOBAL: Spread máximo ═══
                         if spread > MAX_SPREAD_PCT:
                             memoria[nombre] = {'delta': d_actual}
                             continue
 
-                        # ═══════════════════════════════════════
-                        # 🐋 VÍA 1: BALLENA
-                        # Solo necesita: delta absoluto ≥ umbral
-                        # ═══════════════════════════════════════
+                        # ═══ 🐋 BALLENA ═══
                         es_ballena = abs(cambio) >= UMBRAL_BALLENA
 
-                        # ═══════════════════════════════════════
-                        # 🥷 VÍA 2: INSIDER (TODOS obligatorios)
-                        # Delta ≥ umbral AND
-                        # Delta% ≥ mínimo AND
-                        # Spread ≥ mínimo AND
-                        # Toxicidad ≥ mínimo
-                        # ═══════════════════════════════════════
+                        # ═══ 🥷 INSIDER (TODOS AND) ═══
                         es_insider = (
                             abs(cambio) >= UMBRAL_INSIDER
                             and delta_pct >= MIN_DELTA_PCT
@@ -469,12 +497,14 @@ def bucle_principal():
                                 f"📌 *{nombre}*\n\n"
                                 f"💰 *Cambio:* `${cambio:,}` (`{delta_pct}%`)\n"
                                 f"🕰️ *Delta:* `${d_pasado:,}` → `${d_actual:,}`\n"
-                                f"   ├ YES: `${datos['delta_yes']:,}` | NO: `${datos['delta_no']:,}`\n"
+                                f"   ├ YES: `${datos['delta_yes']:,}` (B:${datos['bids_yes']:,} A:${datos['asks_yes']:,})\n"
+                                f"   └ NO:  `${datos['delta_no']:,}` (B:${datos['bids_no']:,} A:${datos['asks_no']:,})\n"
                                 f"💧 *Liquidez:* `${liquidez:,}`\n"
                                 f"⚖️ *Acción:* {tipo}\n\n"
                                 f"🏷️ Precio: `${datos['precio']:.3f}`\n"
                                 f"📈 Bid/Ask: `${datos['best_bid']:.3f}` / `${datos['best_ask']:.3f}`\n"
                                 f"🏃 Spread: `{spread}%` | 🌊 Tox: `{tox}%`\n"
+                                f"📏 Depth: `{DEPTH_PCT}%`\n"
                                 f"✅ *Razón:* {razon}\n\n"
                                 f"🔗 [Ver en Polymarket](https://polymarket.com/event/{m.get('slug', '')})"
                             )
